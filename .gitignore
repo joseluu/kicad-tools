@@ -60,6 +60,7 @@ boards/*/*/output/board.json
 .loom/issue-failures.json
 .loom/interventions/
 .loom/worktrees/
+.loom/worktrees-local/
 .loom/state.json
 .loom/mcp-command.json
 .loom/activity.db
