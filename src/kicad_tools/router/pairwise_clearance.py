@@ -39,18 +39,119 @@ byte-identically.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterable, Mapping, NamedTuple
+from typing import TYPE_CHECKING, Iterable, Mapping, NamedTuple, Sequence
 
 from kicad_tools.core.geometry import segment_to_segment_distance
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from kicad_tools.router.primitives import Route, Segment
+    from kicad_tools.schema.pcb import Footprint
 
 # A pairwise conflict is only reported when the edge-to-edge gap falls short of
 # the requirement by more than this tolerance (mm).  Mirrors the census'
 # ``_PASS_TOLERANCE`` -- a sub-micron shortfall is FP noise, not a real defect.
 _PASS_TOLERANCE = 1e-4
+
+# Extra necking distance beyond the footprint courtyard (or pad-bounds
+# fallback).  Kept as data rather than CLI policy so the same flat regions can
+# cross the Python/C++ boundary in Phase 2.
+ATTACH_ZONE_MARGIN_MM = 0.5
+
+
+@dataclass(frozen=True)
+class AttachZone:
+    """Layer-agnostic rated-footprint necking region.
+
+    ``net_names`` contains every connected net terminating on the footprint.
+    Pairwise widening is waived only when the gap point is inside the bbox and
+    *both* nets are members; the scalar DRU check has already run separately.
+    """
+
+    min_x: float
+    min_y: float
+    max_x: float
+    max_y: float
+    net_names: frozenset[str]
+
+    def exempts(self, x: float, y: float, net_a: str, net_b: str) -> bool:
+        a = _norm_net_key(net_a)
+        b = _norm_net_key(net_b)
+        return (
+            self.min_x <= x <= self.max_x
+            and self.min_y <= y <= self.max_y
+            and a in self.net_names
+            and b in self.net_names
+        )
+
+
+def build_attach_zones(
+    footprints: Iterable[Footprint],
+    *,
+    margin: float = ATTACH_ZONE_MARGIN_MM,
+) -> tuple[AttachZone, ...]:
+    """Build flat courtyard-bbox attach zones once for a routing session.
+
+    The canonical courtyard polygon resolver supplies geometry when possible.
+    Footprints without a resolvable courtyard fall back to the transformed pad
+    bounding box, including pad extents.  Empty/unconnected/single-net
+    footprints cannot exempt a pair and are omitted.
+    """
+    from shapely.geometry import Polygon  # type: ignore[import-untyped]
+
+    from kicad_tools.geometry.courtyard import _courtyard_polygon, _fp_transform
+
+    zones: list[AttachZone] = []
+    for footprint in footprints:
+        names = frozenset(_norm_net_key(pad.net_name) for pad in footprint.pads if pad.net_name)
+        if len(names) < 2:
+            continue
+
+        bounds: list[tuple[float, float, float, float]] = []
+        for side in ("F", "B"):
+            polygon = _courtyard_polygon(footprint, side, Polygon)
+            if polygon is not None:
+                min_x, min_y, max_x, max_y = polygon.bounds
+                bounds.append((float(min_x), float(min_y), float(max_x), float(max_y)))
+
+        if not bounds:
+            transform = _fp_transform(footprint)
+            for pad in footprint.pads:
+                x, y = transform(pad.position)
+                # Pad rotation is absolute in the board frame (it already
+                # includes the parent footprint rotation).  Project all four
+                # rectangular corners onto board axes so the fallback never
+                # excludes rotated pad copper.
+                angle = math.radians(-getattr(pad, "rotation", 0.0))
+                cos_rot = math.cos(angle)
+                sin_rot = math.sin(angle)
+                half_w = abs(cos_rot) * pad.size[0] / 2.0 + abs(sin_rot) * pad.size[1] / 2.0
+                half_h = abs(sin_rot) * pad.size[0] / 2.0 + abs(cos_rot) * pad.size[1] / 2.0
+                bounds.append((x - half_w, y - half_h, x + half_w, y + half_h))
+        if not bounds:
+            continue
+
+        zones.append(
+            AttachZone(
+                min(b[0] for b in bounds) - margin,
+                min(b[1] for b in bounds) - margin,
+                max(b[2] for b in bounds) + margin,
+                max(b[3] for b in bounds) + margin,
+                names,
+            )
+        )
+    return tuple(zones)
+
+
+def _attach_zone_exempts(
+    zones: Sequence[AttachZone],
+    x: float,
+    y: float,
+    net_a: str,
+    net_b: str,
+) -> bool:
+    return any(zone.exempts(x, y, net_a, net_b) for zone in zones)
 
 
 def _norm_net_key(name: str) -> str:
@@ -188,6 +289,67 @@ def _segment_edge_gap(seg_a: Segment, seg_b: Segment) -> float:
     return centre - seg_a.width / 2.0 - seg_b.width / 2.0
 
 
+def _closest_gap_midpoint(seg_a: Segment, seg_b: Segment) -> tuple[float, float]:
+    """Return the midpoint between the closest points on two line segments."""
+    ux, uy = seg_a.x2 - seg_a.x1, seg_a.y2 - seg_a.y1
+    vx, vy = seg_b.x2 - seg_b.x1, seg_b.y2 - seg_b.y1
+    wx, wy = seg_a.x1 - seg_b.x1, seg_a.y1 - seg_b.y1
+    a = ux * ux + uy * uy
+    b = ux * vx + uy * vy
+    c = vx * vx + vy * vy
+    d = ux * wx + uy * wy
+    e = vx * wx + vy * wy
+
+    if a <= 1e-15 and c <= 1e-15:
+        return ((seg_a.x1 + seg_b.x1) / 2.0, (seg_a.y1 + seg_b.y1) / 2.0)
+    if a <= 1e-15:
+        t = max(0.0, min(1.0, e / c))
+        closest_b = (seg_b.x1 + t * vx, seg_b.y1 + t * vy)
+        return ((seg_a.x1 + closest_b[0]) / 2.0, (seg_a.y1 + closest_b[1]) / 2.0)
+    if c <= 1e-15:
+        s = max(0.0, min(1.0, -d / a))
+        closest_a = (seg_a.x1 + s * ux, seg_a.y1 + s * uy)
+        return ((closest_a[0] + seg_b.x1) / 2.0, (closest_a[1] + seg_b.y1) / 2.0)
+
+    denominator = a * c - b * b
+    s_num, s_den = denominator, denominator
+    t_num, t_den = denominator, denominator
+
+    if denominator <= 1e-15:
+        s_num, s_den = 0.0, 1.0
+        t_num, t_den = e, c
+    else:
+        s_num = b * e - c * d
+        t_num = a * e - b * d
+        if s_num < 0.0:
+            s_num, t_num, t_den = 0.0, e, c
+        elif s_num > s_den:
+            s_num, t_num, t_den = s_den, e + b, c
+
+    if t_num < 0.0:
+        t_num = 0.0
+        if -d < 0.0:
+            s_num, s_den = 0.0, 1.0
+        elif -d > a:
+            s_num, s_den = 1.0, 1.0
+        else:
+            s_num, s_den = -d, a
+    elif t_num > t_den:
+        t_num = t_den
+        if -d + b < 0.0:
+            s_num, s_den = 0.0, 1.0
+        elif -d + b > a:
+            s_num, s_den = 1.0, 1.0
+        else:
+            s_num, s_den = -d + b, a
+
+    s = 0.0 if abs(s_num) <= 1e-15 else s_num / s_den
+    t = 0.0 if abs(t_num) <= 1e-15 else t_num / t_den
+    closest_a = (seg_a.x1 + s * ux, seg_a.y1 + s * uy)
+    closest_b = (seg_b.x1 + t * vx, seg_b.y1 + t * vy)
+    return ((closest_a[0] + closest_b[0]) / 2.0, (closest_a[1] + closest_b[1]) / 2.0)
+
+
 def segment_pair_violation(
     seg_a: Segment,
     seg_b: Segment,
@@ -196,6 +358,7 @@ def segment_pair_violation(
     net_a_name: str | None = None,
     net_b_name: str | None = None,
     dru: float | None = None,
+    attach_zones: Sequence[AttachZone] = (),
     tolerance: float = _PASS_TOLERANCE,
 ) -> PairwiseViolation | None:
     """Check one segment pair against its derived pairwise requirement.
@@ -227,13 +390,18 @@ def segment_pair_violation(
     gap = _segment_edge_gap(seg_a, seg_b)
     if gap >= required - tolerance:
         return None
+    gap_x, gap_y = _closest_gap_midpoint(seg_a, seg_b)
+    if gap >= floor - tolerance and _attach_zone_exempts(
+        attach_zones, gap_x, gap_y, a_name, b_name
+    ):
+        return None
     return PairwiseViolation(
         net_a=a_name,
         net_b=b_name,
         actual_mm=gap,
         required_mm=required,
-        x=(seg_b.x1 + seg_b.x2) / 2.0,
-        y=(seg_b.y1 + seg_b.y2) / 2.0,
+        x=gap_x,
+        y=gap_y,
     )
 
 
@@ -245,6 +413,7 @@ def route_pairwise_violation(
     *,
     id_to_name: Mapping[int, str] | None = None,
     dru: float | None = None,
+    attach_zones: Sequence[AttachZone] = (),
     tolerance: float = _PASS_TOLERANCE,
 ) -> PairwiseViolation | None:
     """Find the first pairwise-clearance shortfall for a freshly-routed net.
@@ -286,6 +455,7 @@ def route_pairwise_violation(
                     net_a_name=moving_name,
                     net_b_name=foreign_name,
                     dru=floor,
+                    attach_zones=attach_zones,
                     tolerance=tolerance,
                 )
                 if violation is not None:
