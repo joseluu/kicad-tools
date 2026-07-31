@@ -11,6 +11,196 @@ from kicad_tools.validate.connectivity import (
     ConnectivityValidator,
 )
 
+ORPHANED_ZONE_ISLAND_PCB = """(kicad_pcb
+  (version 20240108) (generator "test") (generator_version "8.0")
+  (general (thickness 1.6)) (paper "A4")
+  (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+  (setup (pad_to_mask_clearance 0))
+  (net 0 "") (net 1 "GND")
+  (footprint "Test:Pad" (layer "F.Cu") (at 2 2)
+    (property "Reference" "J1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 1 "GND")))
+  (zone (net 1) (net_name "GND") (layer "F.Cu")
+    (hatch edge 0.5) (connect_pads (clearance 0.2)) (min_thickness 0.2)
+    (fill yes)
+    (polygon (pts (xy 0 0) (xy 12 0) (xy 12 4) (xy 0 4)))
+    (filled_polygon (layer "F.Cu")
+      (pts (xy 1 1) (xy 3 1) (xy 3 3) (xy 1 3)))
+    (filled_polygon (layer "F.Cu")
+      (pts (xy 9 1) (xy 11 1) (xy 11 3) (xy 9 3))))
+)"""
+
+
+def test_reports_orphaned_zone_fill_island(tmp_path: Path) -> None:
+    """A pad-less fill is visible instead of being dropped with synthetic nodes."""
+    pytest.importorskip("shapely")
+    pcb_path = tmp_path / "orphan.kicad_pcb"
+    pcb_path.write_text(ORPHANED_ZONE_ISLAND_PCB)
+
+    result = ConnectivityValidator(pcb_path).validate()
+
+    assert len(result.zone_islands) == 1
+    assert result.zone_islands[0].net_name == "GND"
+    assert "fill[1]@F.Cu" in result.zone_islands[0].message
+    assert result.to_dict()["issues"][0]["issue_type"] == "zone_island"
+
+
+def test_connected_zone_fill_island_stays_clean(tmp_path: Path) -> None:
+    """Spatially distinct islands bonded to distinct pads stay clean."""
+    pytest.importorskip("shapely")
+    pcb_path = tmp_path / "bonded.kicad_pcb"
+    pcb_path.write_text(
+        ORPHANED_ZONE_ISLAND_PCB.replace(
+            "  (zone (net 1)",
+            """  (footprint "Test:Pad" (layer "F.Cu") (at 10 2)
+    (property "Reference" "J2" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 1 "GND")))
+  (segment (start 2 2) (end 10 2) (width 0.3) (layer "F.Cu") (net 1))
+  (zone (net 1)""",
+        )
+    )
+
+    assert ConnectivityValidator(pcb_path).validate().zone_islands == []
+
+
+@pytest.mark.parametrize(
+    ("relative_board", "expected"),
+    [
+        ("boards/03-usb-joystick/output/usb_joystick_routed.kicad_pcb", 12),
+        ("boards/05-bldc-motor-controller/output/bldc_controller_routed.kicad_pcb", 57),
+    ],
+)
+def test_native_fleet_relationship_parity(relative_board: str, expected: int) -> None:
+    """The native-gated path reproduces committed board03/05 relationships."""
+    from kicad_tools.cli.runner import find_kicad_cli
+
+    if find_kicad_cli() is None:
+        pytest.skip("kicad-cli is not installed")
+    board = Path(__file__).parents[1] / relative_board
+    result = ConnectivityValidator(board).validate(reconcile_native=True)
+
+    assert len(result.issues) == expected
+    assert all(len(issue.islands) == 2 for issue in result.issues)
+
+
+def _fake_kicad_cli_drc(payload: dict):
+    """Return a ``subprocess.run`` stand-in that emits ``payload`` as the report.
+
+    Both ``run_geometric_drc`` and the connectivity native path shell the
+    same ``kicad-cli pcb drc --format json`` command with an output path
+    argument, so one fake feeds both consumers the *identical* report --
+    which is exactly what the dual-contract assertion needs.
+    """
+    import json
+    import subprocess
+
+    def _run(cmd, *args, **kwargs):
+        argv = [str(c) for c in cmd]
+        for flag in ("-o", "--output"):
+            if flag in argv:
+                Path(argv[argv.index(flag) + 1]).write_text(json.dumps(payload))
+                break
+        return subprocess.CompletedProcess(argv, 5, stdout="", stderr="")
+
+    return _run
+
+
+def _unconnected_payload(count: int) -> dict:
+    """A KiCad-shaped JSON report with ``count`` connectivity relationships."""
+    return {
+        "source": "board.kicad_pcb",
+        "violations": [],
+        "unconnected_items": [
+            {
+                "type": "unconnected_items",
+                "severity": "error",
+                "description": "Missing connection between items",
+                "items": [
+                    {"description": "Zone [GND] on F.Cu", "pos": {"x": float(i), "y": 1.0}},
+                    {"description": f"Pad {i} [GND] of U1 on B.Cu", "pos": {"x": 2.0, "y": 2.0}},
+                ],
+            }
+            for i in range(count)
+        ],
+        "schematic_parity": [],
+    }
+
+
+def test_connectivity_and_geometry_contracts_hold_simultaneously(tmp_path, monkeypatch) -> None:
+    """Issue #4498 boundary: one kicad-cli report, two independent verdicts.
+
+    A board03-shaped report (12 ``unconnected_items``, no geometric
+    violations) must produce **12** connectivity relationships for
+    :class:`ConnectivityValidator` AND **0** errors for
+    :func:`run_geometric_drc` -- the geometry-only consumers that gate
+    "this board is geometrically DRC clean" must not acquire those 12 as
+    geometric violations.
+    """
+    import subprocess
+
+    import kicad_tools.cli.runner as runner_mod
+    from kicad_tools.drc import run_geometric_drc
+
+    pytest.importorskip("shapely")
+    board = tmp_path / "board.kicad_pcb"
+    board.write_text(ORPHANED_ZONE_ISLAND_PCB)
+
+    monkeypatch.setattr(runner_mod, "find_kicad_cli", lambda *a, **k: Path("/usr/bin/kicad-cli"))
+    monkeypatch.setattr(subprocess, "run", _fake_kicad_cli_drc(_unconnected_payload(12)))
+
+    # Contract 1 -- connectivity sees all 12 relationships.
+    result = ConnectivityValidator(board).validate(reconcile_native=True)
+    assert len(result.issues) == 12
+    assert {issue.issue_type for issue in result.issues} == {"zone_island"}
+    assert result.error_count == 12
+
+    # Contract 2 -- geometry-only consumers see zero, from the same report.
+    geo = run_geometric_drc(board)
+    assert geo.ran is True
+    assert geo.error_count == 0, f"connectivity leaked into geometric DRC: {geo.by_type}"
+    assert "unconnected_items" not in geo.by_type
+
+
+def test_board03_connectivity_and_geometry_contracts_native(tmp_path) -> None:
+    """The same dual contract on the real committed board-03 artifact.
+
+    board-03 is the fleet's canonical case: ``kicad-cli pcb drc
+    --refill-zones`` reports 12 ``unconnected_items`` and 0 geometric
+    errors.  kct must report both numbers, on the same board, at once.
+    """
+    import shutil
+
+    from kicad_tools.cli.runner import find_kicad_cli
+    from kicad_tools.drc import run_geometric_drc
+
+    if find_kicad_cli() is None:
+        pytest.skip("kicad-cli is not installed")
+    src = Path(__file__).parents[1] / "boards/03-usb-joystick/output/usb_joystick_routed.kicad_pcb"
+    if not src.exists():
+        pytest.skip(f"committed routed board not found at {src!s}")
+
+    # Copy into tmp_path so kicad-cli's .kicad_prl sidecar never lands in
+    # the committed board tree.
+    board = tmp_path / src.name
+    shutil.copy(src, board)
+    for suffix in (".kicad_pro", ".kicad_dru"):
+        sidecar = src.with_suffix(suffix)
+        if sidecar.exists():
+            shutil.copy(sidecar, board.with_suffix(suffix))
+
+    connectivity = ConnectivityValidator(board).validate(reconcile_native=True)
+    geometric = run_geometric_drc(board)
+
+    assert len(connectivity.issues) == 12, (
+        f"board-03 connectivity relationships changed: {len(connectivity.issues)}"
+    )
+    assert geometric.ran is True, f"geometric DRC did not run: {geometric.note}"
+    assert geometric.error_count == 0, (
+        "board-03 is geometrically clean; connectivity relationships must not "
+        f"be counted as geometric violations: {geometric.by_type}"
+    )
+
+
 # PCB with fully connected nets (all pads connected via tracks)
 FULLY_CONNECTED_PCB = """(kicad_pcb
   (version 20240108)
@@ -1082,6 +1272,22 @@ class TestZeroFillZoneConnectivity:
 class TestConnectivityCLI:
     """Tests for connectivity validation CLI."""
 
+    @staticmethod
+    def _twelve_unconnected_items() -> ConnectivityResult:
+        """Model board03's native-reconciled result without requiring KiCad."""
+        issues = [
+            ConnectivityIssue(
+                severity="error",
+                issue_type="zone_island",
+                net_name="GND",
+                message=f"Missing connection between native items {index} and {index + 1}",
+                suggestion="Connect the items reported by kicad-cli",
+                islands=((f"item-{index}",), (f"item-{index + 1}",)),
+            )
+            for index in range(12)
+        ]
+        return ConnectivityResult(issues=issues, total_nets=13, connected_nets=1)
+
     def test_cli_fully_connected(self, fully_connected_pcb: Path):
         """Test CLI with fully connected PCB."""
         from kicad_tools.cli.validate_connectivity_cmd import main
@@ -1117,6 +1323,40 @@ class TestConnectivityCLI:
         captured = capsys.readouterr()
         assert "Connectivity:" in captured.out
         assert "Nets connected:" in captured.out
+
+    @pytest.mark.parametrize("output_format", ["table", "summary", "json"])
+    def test_cli_reports_twelve_reconciled_items(
+        self,
+        output_format: str,
+        fully_connected_pcb: Path,
+        capsys,
+        monkeypatch,
+    ):
+        """Every CLI format exposes board03's 12 reconciled relationships."""
+        import json
+
+        from kicad_tools.cli.validate_connectivity_cmd import main
+
+        result = self._twelve_unconnected_items()
+        monkeypatch.setattr(ConnectivityValidator, "validate", lambda self, **kwargs: result)
+
+        exit_code = main([str(fully_connected_pcb), "--format", output_format])
+        captured = capsys.readouterr()
+
+        assert exit_code == 1
+        if output_format == "json":
+            data = json.loads(captured.out)
+            assert data["summary"]["zone_island_count"] == 12
+            assert len(data["issues"]) == 12
+            assert {issue["issue_type"] for issue in data["issues"]} == {"zone_island"}
+        else:
+            assert "12" in captured.out
+            assert "0 unconnected pads" not in captured.out
+            if output_format == "table":
+                assert "UNCONNECTED ZONE/ITEM RELATIONSHIPS (12)" in captured.out
+                assert captured.out.count("[X] ERROR:") == 12
+            else:
+                assert "Unconnected items: 12" in captured.out
 
     def test_cli_errors_only(self, partially_connected_pcb: Path, capsys):
         """Test CLI with --errors-only flag."""

@@ -79,7 +79,7 @@ class ConnectivityIssue:
         """Validate severity and issue_type values."""
         if self.severity not in ("error", "warning"):
             raise ValueError(f"severity must be 'error' or 'warning', got {self.severity!r}")
-        valid_types = ("unrouted", "partial", "isolated")
+        valid_types = ("unrouted", "partial", "isolated", "zone_island")
         if self.issue_type not in valid_types:
             raise ValueError(f"issue_type must be one of {valid_types}, got {self.issue_type!r}")
 
@@ -170,6 +170,11 @@ class ConnectivityResult:
         return [i for i in self.issues if i.issue_type == "isolated"]
 
     @property
+    def zone_islands(self) -> list[ConnectivityIssue]:
+        """Filled zone islands with no same-net copper attachment."""
+        return [i for i in self.issues if i.issue_type == "zone_island"]
+
+    @property
     def unconnected_pad_count(self) -> int:
         """Total number of unconnected pads."""
         return sum(len(i.unconnected_pads) for i in self.issues)
@@ -221,6 +226,8 @@ class ConnectivityResult:
             parts.append(f"  Partial connections: {len(self.partial)}")
         if self.isolated:
             parts.append(f"  Isolated pads: {len(self.isolated)}")
+        if self.zone_islands:
+            parts.append(f"  Orphaned zone islands: {len(self.zone_islands)}")
         parts.append(f"  Total unconnected pads: {self.unconnected_pad_count}")
 
         return "\n".join(parts)
@@ -266,17 +273,27 @@ class ConnectivityValidator:
         from kicad_tools.schema.pcb import PCB as PCBClass
 
         if isinstance(pcb, (str, Path)):
+            self.pcb_path: Path | None = Path(pcb)
             self.pcb = PCBClass.load(str(pcb))
         else:
+            self.pcb_path = None
             self.pcb = pcb
 
-    def validate(self) -> ConnectivityResult:
+    def validate(self, *, reconcile_native: bool = False) -> ConnectivityResult:
         """Run connectivity validation on all nets.
 
         Returns:
             ConnectivityResult containing all issues found
         """
         result = ConnectivityResult()
+
+        # Issue #4498: model every same-net copper item as a graph node on
+        # zone-bearing nets.  The old pad partition collapsed an entire zone
+        # after the first pad touched it, hiding zone↔zone, zone↔pad and
+        # pad↔pad disconnects within the same declared net.
+        item_relationships = self._find_unconnected_item_relationships()
+        for issue in (issue for issues in item_relationships.values() for issue in issues):
+            result.add(issue)
 
         # Get all non-empty nets (skip net 0 which is unconnected)
         nets = {n: net for n, net in self.pcb.nets.items() if n != 0 and net.name}
@@ -292,6 +309,12 @@ class ConnectivityValidator:
         has_footprints = len(self.pcb.footprints) > 0
 
         for net_number, net in nets.items():
+            if net_number in item_relationships:
+                if not item_relationships[net_number]:
+                    connected_count += 1
+                    zone_connected_count += 1
+                continue
+
             # Get all pads on this net
             pads = self._get_net_pads(net_number)
 
@@ -328,7 +351,256 @@ class ConnectivityValidator:
 
         result.connected_nets = connected_count
         result.zone_connected_nets = zone_connected_count
+        if reconcile_native:
+            native_issues = self._native_unconnected_relationships()
+            if native_issues is not None:
+                result.issues = native_issues
         return result
+
+    def _native_unconnected_relationships(self) -> list[ConnectivityIssue] | None:
+        """Return KiCad's per-item relationships, or ``None`` when unavailable.
+
+        This is the explicit high-fidelity reconciliation path permitted by
+        #4498.  The internal graph remains available in KiCad-less installs;
+        callers that require native parity opt in with
+        ``validate(reconcile_native=True)``.
+
+        Fleet characterization (2026-07-30): the internal graph exactly
+        reproduces board03's 12 relationships and reports 60 on board05 versus
+        KiCad's 57.  The residual three are thermal-spoke associations that are
+        not represented as explicit solid geometry in the persisted board.
+        Refill-time connectivity is therefore authoritative for the opt-in
+        path; it reports board05's exact current 57 without weakening the
+        KiCad-less fail-visible model.
+        """
+        if self.pcb_path is None:
+            return None
+
+        import subprocess
+        import tempfile
+
+        from kicad_tools.cli.runner import find_kicad_cli
+        from kicad_tools.drc import DRCReport
+
+        kicad_cli = find_kicad_cli()
+        if kicad_cli is None:
+            return None
+        with tempfile.NamedTemporaryFile(suffix=".json") as report_file:
+            proc = subprocess.run(
+                [
+                    str(kicad_cli),
+                    "pcb",
+                    "drc",
+                    "--refill-zones",
+                    "--format",
+                    "json",
+                    "-o",
+                    report_file.name,
+                    str(self.pcb_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            if proc.returncode not in (0, 5):
+                return None
+            report = DRCReport.load(report_file.name)
+
+        # Connectivity relationships live in the report's dedicated
+        # ``unconnected_items`` collection, NOT in ``violations`` -- the
+        # geometric collection keeps its pre-#4498 meaning for every
+        # ``run_geometric_drc`` consumer.
+        issues: list[ConnectivityIssue] = []
+        for index, violation in enumerate(report.connectivity_items()):
+            item_ids = tuple(violation.items) or (f"native-unconnected[{index}]",)
+            issues.append(
+                ConnectivityIssue(
+                    severity="error",
+                    issue_type="zone_island",
+                    net_name=violation.nets[0] if violation.nets else "<native>",
+                    message=violation.message,
+                    suggestion="Connect the items reported by kicad-cli",
+                    islands=tuple((item_id,) for item_id in item_ids),
+                )
+            )
+        return issues
+
+    def _find_unconnected_item_relationships(self) -> dict[int, list[ConnectivityIssue]]:
+        """Return missing relationships between physical same-net components.
+
+        Pads, vias, segments, and each individual ``filled_polygon`` are graph
+        nodes.  Nodes union only when their copper intersects on a shared layer;
+        a via or through-hole pad is one node carrying all bridged layers.  For
+        each zone-bearing net, one issue is emitted for every component beyond
+        the first, matching KiCad's ratsnest relationship granularity instead
+        of emitting one coarse issue per net.
+
+        The label-only fallback cannot distinguish filled islands and retains
+        the pre-#4498 pad model when Shapely is unavailable.
+        """
+        if not _has_shapely():
+            return {}
+
+        from kicad_tools.geometry.copper import segment_copper_polygon
+
+        modeled_nets = {
+            zone.net_number for zone in self.pcb.zones if zone.net_number and zone.filled_polygons
+        }
+        relationships: dict[int, list[ConnectivityIssue]] = {}
+        copper_layers = [layer.name for layer in self.pcb.copper_layers] or ["F.Cu", "B.Cu"]
+
+        for net_number in modeled_nets:
+            # (stable id, human description, {layer: solid geometry}, terminal)
+            items: list[tuple[str, str, dict[str, Any], bool]] = []
+            pad_records: list[tuple[int, list[str], Any]] = []
+            zone_records: list[tuple[Any, str, list[int]]] = []
+            for fp in self.pcb.footprints:
+                for pad in fp.pads:
+                    if pad.net_number != net_number:
+                        continue
+                    geom = self._pad_copper_polygon(fp, pad)
+                    if geom is not None:
+                        layers = [
+                            layer
+                            for layer in copper_layers
+                            if self._pad_layer_matches_zone(pad.layers, layer)
+                        ]
+                        pad_id = f"{fp.reference}.{pad.number}"
+                        items.append(
+                            (
+                                f"pad:{pad_id}",
+                                f"Pad {pad_id}",
+                                dict.fromkeys(layers, geom),
+                                True,
+                            )
+                        )
+                        pad_records.append((len(items) - 1, pad.layers, geom))
+
+            for via_index, via in enumerate(self.pcb.vias):
+                if via.net_number != net_number:
+                    continue
+                radius = max(getattr(via, "size", 0.0) or 0.0, 0.0) / 2.0
+                geom = self._via_copper_geom(via.position, radius)
+                if geom is not None:
+                    items.append(
+                        (
+                            f"via:{via_index}",
+                            f"Via {via_index}",
+                            dict.fromkeys(self._via_bridged_layers(via.layers), geom),
+                            False,
+                        )
+                    )
+
+            for seg_index, seg in enumerate(self.pcb.segments):
+                if seg.net_number != net_number:
+                    continue
+                geom = segment_copper_polygon(seg.start, seg.end, seg.width)
+                if geom is not None:
+                    items.append(
+                        (
+                            f"segment:{seg_index}",
+                            f"Segment {seg_index}",
+                            {seg.layer: geom},
+                            False,
+                        )
+                    )
+
+            for zone_index, zone in enumerate(self.pcb.zones):
+                if zone.net_number != net_number:
+                    continue
+                fill_indices: list[int] = []
+                for fill_index, fill_pts in enumerate(zone.filled_polygons):
+                    region = self._fill_solid_region(fill_pts)
+                    if region is None:
+                        continue
+                    layer = zone.filled_polygon_layer(fill_index)
+                    item_id = f"zone[{zone_index}].fill[{fill_index}]@{layer}"
+                    items.append((item_id, f"Zone island {item_id}", {layer: region}, True))
+                    fill_indices.append(len(items) - 1)
+                boundary = self._fill_solid_region(zone.polygon)
+                if boundary is not None and fill_indices:
+                    zone_records.append((boundary, zone.layer, fill_indices))
+
+            parent = list(range(len(items)))
+
+            def find(index: int) -> int:
+                while parent[index] != index:
+                    parent[index] = parent[parent[index]]
+                    index = parent[index]
+                return index
+
+            def union(left: int, right: int) -> None:
+                left_root, right_root = find(left), find(right)
+                if left_root != right_root:
+                    parent[right_root] = left_root
+
+            for left, (_, _, left_geoms, _) in enumerate(items):
+                for right in range(left + 1, len(items)):
+                    right_geoms = items[right][2]
+                    if any(
+                        left_geoms[layer].intersects(right_geoms[layer])
+                        for layer in left_geoms.keys() & right_geoms.keys()
+                    ):
+                        union(left, right)
+
+            # Persisted fill polygons omit thermal spokes around same-net pads.
+            # Preserve the established #479 boundary behavior without
+            # collapsing every island in the zone: a pad inside the zone
+            # boundary bonds only to the nearest fill island on that layer.
+            for boundary, layer, fill_indices in zone_records:
+                layer_fills = [index for index in fill_indices if layer in items[index][2]]
+                if not layer_fills:
+                    continue
+                for pad_index, pad_layers, pad_geom in pad_records:
+                    if not self._pad_layer_matches_zone(pad_layers, layer):
+                        continue
+                    if not boundary.intersects(pad_geom):
+                        continue
+                    nearest = min(
+                        layer_fills,
+                        key=lambda index: pad_geom.distance(items[index][2][layer]),
+                    )
+                    union(pad_index, nearest)
+
+            components: dict[int, list[int]] = {}
+            for index in range(len(items)):
+                components.setdefault(find(index), []).append(index)
+            # KiCad ratsnest relationships are between electrically meaningful
+            # endpoints (pads and zone islands); track/via-only fragments merely
+            # carry connectivity between them.
+            terminal_components = [
+                component
+                for component in components.values()
+                if any(items[index][3] for index in component)
+            ]
+            terminal_components.sort(
+                key=lambda component: min(items[index][0] for index in component)
+            )
+
+            net = self.pcb.nets.get(net_number)
+            net_name = net.name if net is not None else f"net-{net_number}"
+            issues: list[ConnectivityIssue] = []
+            if terminal_components:
+                anchor = terminal_components[0]
+                anchor_item = next(index for index in anchor if items[index][3])
+                for component in terminal_components[1:]:
+                    remote_item = next(index for index in component if items[index][3])
+                    left_id, left_desc = items[anchor_item][0:2]
+                    right_id, right_desc = items[remote_item][0:2]
+                    issues.append(
+                        ConnectivityIssue(
+                            severity="error",
+                            issue_type="zone_island",
+                            net_name=net_name,
+                            message=f"Missing connection between {left_desc} and {right_desc}",
+                            suggestion="Connect the same-net copper components",
+                            islands=((left_id,), (right_id,)),
+                        )
+                    )
+            relationships[net_number] = issues
+
+        return relationships
 
     def extract_pad_partition(self) -> list[frozenset[str]]:
         """Extract the *physical* pad partition from routed copper.
