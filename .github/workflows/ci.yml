@@ -747,7 +747,20 @@ jobs:
     # diffpair-routing-regression job (also timeout-minutes: 30) rather than a
     # special exception, and does NOT weaken any correctness gate -- the pour
     # connectivity + DRC allowlist floors are unchanged.
-    timeout-minutes: 30
+    #
+    # Issue #4468 (epic #3438 Phase 3) re-measure: the board-07 route step now
+    # performs up to THREE full negotiated passes -- the baseline pass plus the
+    # two ``--placement-delta-feedback-budget 2`` probes, each granted its own
+    # 600 s budget so a probe's re-route is compared against the baseline on
+    # equal terms.  Measured locally solo: 27m05s vs ~16 min for the loop-off
+    # recipe.  Bumped 30 -> 90 for the extra passes plus 2-core-runner
+    # variance; this is a WALL-CLOCK allowance, not a correctness threshold --
+    # the pour connectivity gate and the DRC allowlist floor are unchanged
+    # (the floor was RE-MEASURED at 8 on the delta-loop artifact, the same
+    # value the committed floor already carries, and 2 better than a loop-off
+    # local regen).  90 min matches the precedent already set by
+    # board-05-routing-regression.
+    timeout-minutes: 90
     # Issue #3146 closure: the matrix-scoped soft-fail
     # (``continue-on-error: ${{ matrix.board == 'boards/07-matchgroup-test' }}``)
     # that PR #3145 installed pending matchgroup-routing
@@ -1510,6 +1523,16 @@ jobs:
     #   the honest ``lvs_clean: false`` (gallery: "LVS: 5 mismatches",
     #   status 'partial').
     #
+    # Issue #4468 (epic #3438 Phase 3) added the classifier-driven
+    # placement-delta feedback loop to this board's route step and
+    # measured it: the set is UNCHANGED at these 5.  The loop does find a
+    # reach-improving move (a 2 mm translate of U3 closes MIPI_DAT0_N,
+    # 26/31 -> 27/31) but refuses it because it also raises the router's
+    # clearance-violation count -- see boards/07-matchgroup-test/README.md
+    # 'Placement-delta feedback' for the per-probe measurements.  The list
+    # is a MAXIMUM: shrink it when a delta genuinely survives, never widen
+    # it to absorb one.
+    #
     # NEW, ADDITIVE gate -- does NOT replace the
     # ``matchgroup-routing-regression`` job.  Board 07 carries allowlisted
     # DRC residuals (.github/routed-drc-tolerance.yml) and routes PARTIAL
@@ -1519,7 +1542,16 @@ jobs:
     # Advisory until a repo admin adds it to branch protection.
     name: Board 07 End-to-End (LVS known opens)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Issue #4468: the route step now performs up to THREE full negotiated
+    # passes (the baseline pass plus the two
+    # ``--placement-delta-feedback-budget 2`` probes, each granted its own
+    # 600 s budget so a probe is compared against the baseline on equal
+    # terms) instead of one.  Measured locally solo: 27m05s vs ~16 min for
+    # the loop-off recipe.  This is a wall-clock allowance, NOT a
+    # correctness threshold -- every gate below is unchanged (the known-open
+    # set and the DRC allowlist floor both hold).  90 min matches the
+    # precedent set by ``board-05-routing-regression``.
+    timeout-minutes: 90
     container:
       image: kicad/kicad:10.0
       options: --user 0:0

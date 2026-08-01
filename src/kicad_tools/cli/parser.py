@@ -3940,6 +3940,55 @@ def _add_route_parser(subparsers) -> None:
             "(only the per-iteration --timeout applies). Issue #2606."
         ),
     )
+    # Issue #4468 (epic #3438 Phase 3): classifier-driven placement-DELTA
+    # feedback.  Distinct from --placement-feedback above: that loop is driven
+    # by blocker geometry and can only translate, while this one is driven by
+    # the stuck-net classifier's ranked fix ladder and can also execute the
+    # ``rotate_180`` de-reverse move on a reversed facing part.
+    route_parser.add_argument(
+        "--placement-delta-feedback",
+        action="store_true",
+        default=False,
+        help=(
+            "After the initial routing pass, if any nets remain unrouted, run "
+            "the classifier-driven placement-DELTA feedback loop: classify the "
+            "routed board, translate each PLACEMENT_BOUND / CONGESTION_SATURATED "
+            "diagnosis into a concrete placement delta (translate or 180-degree "
+            "rotation), apply the top applyable one, re-route, and keep it only "
+            "on a strict routed-net increase. Connectors (J*, P*) and locked "
+            "footprints are auto-anchored. Writes "
+            "<output>_placement_delta.json. Issue #4468."
+        ),
+    )
+    route_parser.add_argument(
+        "--no-placement-delta-feedback",
+        dest="placement_delta_feedback",
+        action="store_false",
+        help="Explicitly disable classifier-driven placement-delta feedback (default).",
+    )
+    route_parser.add_argument(
+        "--placement-delta-feedback-budget",
+        type=int,
+        default=3,
+        metavar="N",
+        help=(
+            "Maximum number of apply/keep-or-revert delta iterations when "
+            "--placement-delta-feedback is set (default: 3)."
+        ),
+    )
+    route_parser.add_argument(
+        "--placement-delta-feedback-timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Per-iteration wall-clock budget for the placement-delta feedback "
+            "loop's re-routes, in seconds. The loop's own allocation: it "
+            "survives an already-exhausted --timeout and gives each delta's "
+            "re-route the same budget the initial pass got. Default: share "
+            "whatever remains of --timeout. Issue #4468."
+        ),
+    )
     route_parser.add_argument(
         "--export-failed-nets",
         metavar="PATH",

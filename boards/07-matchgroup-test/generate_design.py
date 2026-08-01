@@ -85,6 +85,16 @@ warn_if_stale()
 # spec key.
 SUPPORTS_STEP_ROUTE = True
 
+# Issue #4468 (epic #3438 Phase 3): run the classifier-driven placement-delta
+# feedback loop as part of this board's route step.  Declared as module-level
+# constants (rather than inlined in the ``kct route`` argv) so the A/B
+# measurement the issue's acceptance criteria demand is a one-line edit and the
+# recipe's cost contract is stated in one place.  See the block adjacent to the
+# ``cmd`` list in ``route_pcb`` for the empirical record.
+PLACEMENT_DELTA_FEEDBACK = True
+PLACEMENT_DELTA_FEEDBACK_BUDGET = 2
+PLACEMENT_DELTA_FEEDBACK_TIMEOUT_S = 600
+
 
 # =============================================================================
 # Per-Group Net Class Declarations
@@ -1632,6 +1642,64 @@ def route_pcb(input_path: Path, output_path: Path) -> bool:
         str(sidecar_path),
         "--length-match-groups",
     ]
+
+    # Issue #4468 (epic #3438 Phase 3): classifier-driven placement-delta
+    # feedback.  When the negotiated pass leaves nets unrouted, the router
+    # classifies the ROUTED board, translates each PLACEMENT_BOUND /
+    # CONGESTION_SATURATED diagnosis into one concrete placement delta,
+    # applies the top unprobed one, re-routes, and keeps it ONLY when the
+    # re-route strictly increases the routed-net count AND does not increase
+    # the clearance-violation count (otherwise placement, router pads, routes
+    # and the routing grid revert atomically).  This is the loop epic #3438
+    # exists to close, run against this board's real ``Autorouter`` + ``PCB``.
+    #
+    # MEASURED VERDICT (solo, seed 42, C++ backend, PYTHONHASHSEED=42) --
+    # reach stays 26/31, by decision rather than for lack of a candidate.
+    # The loop emits a delta for all 5 open nets and probes the top two:
+    #
+    #   probe 0  U2 rotate_180 (DQ3's DE_REVERSE_BUNDLE verdict)
+    #            routed 25 -> 16, clearance violations 0 -> 1489   REVERTED
+    #   probe 1  U3 translate (-0.77, -1.85) mm (MIPI_DAT0_N's MOVE_PART)
+    #            routed 25 -> 26, clearance violations 0 -> 2      REVERTED
+    #
+    # Probe 0: the classifier is RIGHT that the DDR byte is reversed at U2
+    # (28/28 facing pad pairs invert), but a 180-degree rotation de-reverses
+    # the pad ORDER while moving the facing column to the FAR side of the
+    # package -- the byte then has to wrap a 7x7 mm QFN.  The correct move is
+    # a mirror, which KiCad expresses only as a layer flip.
+    #
+    # Probe 1: a genuine +1 net (26/31 -> 27/31, MIPI_DAT0_N closes) that
+    # costs manufacturability -- two U1-escape clearances drop to 0.076 /
+    # 0.094 mm against the 0.102 mm jlcpcb floor (blocking DRC 10 -> 13) and
+    # the ADDR_BUS length-match tuner is left at 11.03 mm skew instead of
+    # 0.000 mm.  Taking it would have meant widening the board-07 floor in
+    # .github/routed-drc-tolerance.yml from 8 to 13 -- a bad trade on a
+    # match-group/DRC testbench -- so the loop refuses it and records the
+    # refusal (with both measurements) in the delta artifact.
+    #
+    # Budget 2 is deliberate: probe 0 is the classifier's top rung and probe
+    # 1 is the one that is only marginally short of acceptable, so a future
+    # router change that removes those two clearances makes the loop take the
+    # net automatically.  Each budget unit costs one full board-07 re-route;
+    # the whole route step measures 27m05s locally vs ~16 min loop-off (the
+    # CI jobs carry a 90-minute allowance for it).  The delta artifact is
+    # emitted at ``<output>_placement_delta.json`` on every run, so the
+    # proposal set is auditable even though nothing is kept today.
+    if PLACEMENT_DELTA_FEEDBACK:
+        cmd += [
+            "--placement-delta-feedback",
+            "--placement-delta-feedback-budget",
+            str(PLACEMENT_DELTA_FEEDBACK_BUDGET),
+            # The initial negotiated pass CONSUMES the whole ``--timeout 600``
+            # budget on this board (measured 607-630 s), so without an explicit
+            # allocation the loop is skipped before it starts.  Granting each
+            # delta's re-route the SAME 600 s the initial pass got is also what
+            # makes the keep/revert decision meaningful: a re-route on a smaller
+            # budget would under-route for budget reasons and revert every delta
+            # regardless of whether the placement change helped.
+            "--placement-delta-feedback-timeout",
+            str(PLACEMENT_DELTA_FEEDBACK_TIMEOUT_S),
+        ]
 
     # Issue #3146: Pin PYTHONHASHSEED for the subprocess so any string-
     # keyed dict/set iteration in the negotiated router (net_order

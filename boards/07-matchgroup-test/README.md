@@ -158,6 +158,80 @@ verifiers agree on this exact set: `kct net-status --why`,
 `kicad-cli pcb drc --refill-zones` (5 unconnected pads at the same five
 pads).
 
+### Placement-delta feedback (#4468, epic #3438 Phase 3)
+
+The route step runs `kct route --placement-delta-feedback
+--placement-delta-feedback-budget 2 --placement-delta-feedback-timeout
+600` (wired from the `PLACEMENT_DELTA_FEEDBACK*` constants at the top of
+`generate_design.py`).  Each iteration classifies the **routed** board,
+translates every `PLACEMENT_BOUND` / `CONGESTION_SATURATED` diagnosis into
+one concrete placement delta, applies the top unprobed one, re-routes, and
+keeps it only when the re-route **strictly increases the routed-net count
+AND does not increase the router's clearance-violation count** ---
+otherwise placement, router pads, routes and the routing grid revert
+atomically.
+
+**Measured verdict: the reach stays at 26/31, and that is a decision, not
+a failure to find anything.**  Solo, seed 42, C++ backend built,
+`PYTHONHASHSEED=42`, the loop emits a delta for every one of the 5 open
+nets and probes the top two:
+
+| # | Probe | Routed | Clearance violations | Verdict |
+|---|-------|--------|----------------------|---------|
+| 0 | `U2` `rotate_180` --- from `DQ3`'s `DE_REVERSE_BUNDLE` verdict | 25 -> **16** | 0 -> **1489** | reverted |
+| 1 | `U3` translate `(-0.77, -1.85)` mm --- from `MIPI_DAT0_N`'s `MOVE_PART` | 25 -> **26** | 0 -> **2** | reverted (clearance) |
+
+Probe 0 is the informative negative result.  The classifier is **right**
+that the DDR byte is reversed at `U2` --- it measures 28/28 facing pad
+pairs inverted between `U1` and `U2` --- but a 180-degree rotation is not
+the move that fixes it: it de-reverses the pad ORDER while relocating the
+whole facing column to the *far* side of the package, so the byte then has
+to wrap around a 7x7 mm QFN.  Reach collapses to 16/31.  The
+geometrically correct move is a **mirror** of the pad column, which KiCad
+expresses only as a layer flip and which the Phase-1 translator therefore
+never emits.
+
+Probe 1 is the real finding.  A single bounded 2 mm translate of `U3`
+**does** close `MIPI_DAT0_N` --- 26/31 -> 27/31 --- but the extra copper it
+lets into the DDR channel costs manufacturability.  Measured on that
+27/31 artifact:
+
+* two segment-to-pad clearances drop under the jlcpcb floor
+  (0.076 mm and 0.094 mm against a 0.102 mm minimum, at the `U1` DDR
+  escape), taking blocking DRC from 10 to 13 on the same host; and
+* the `ADDR_BUS` length-match tuner, which normally drives that group's
+  skew to **0.000 mm**, is left at **11.03 mm** --- a
+  `match_group_length_skew` error on the very board that exists to
+  exercise that rule.
+
+Shipping it would have required widening
+`.github/routed-drc-tolerance.yml`'s board-07 floor from 8 to 13.  Trading
+a DRC allowlist widening for one net is not an improvement on a
+match-group/DRC testbench, so the loop's acceptance test now requires
+*both* a reach gain and no clearance regression, and this delta is
+refused.  The refusal is recorded, with its measurements, in
+`output/matchgroup_test_routed_placement_delta.json` (the `reverted`
+section carries `routed_before` / `routed_after` and `revert_reason`) so
+the decision is auditable rather than invisible.
+
+Two useful side effects of running the loop, both measured on the same
+host:
+
+* the delta artifact is emitted on **every** run, so the classifier's
+  per-net proposal for each open net is a build output rather than a
+  one-off investigation; and
+* blocking DRC on the shipped artifact measures **8** (equal to the
+  committed allowlist floor) versus **10** for a loop-off local regen ---
+  the loop's atomic revert now also rebuilds the routing grid, which the
+  post-loop optimize/DRC-nudge stages read.
+
+The shipping budget is **2**: probe 0 is the classifier's top-ranked rung
+and probe 1 is the one that is only marginally short of acceptable, so if a
+future router change removes those two clearances the loop will take the
+net automatically.  Each budget unit costs one complete board-07 re-route;
+the whole route step measures **27m05s** locally against ~16 min for the
+loop-off recipe.
+
 ### Fresh per-net verdict (`kct net-status --incomplete --why`)
 
 Measured on the committed routed PCB and reproduced by a from-scratch

@@ -574,14 +574,17 @@ class PlacementFeedbackLoop:
         # a strictly better state was observed earlier in the run.
         #
         # We restore by reassigning ``self.router.routes`` to a deep copy
-        # of the best snapshot.  Note: the grid state is NOT restored.
-        # That is intentional -- the grid is reset by ``_clear_routes()``
-        # at the top of every iteration, so no caller relies on grid
-        # state being consistent with ``self.router.routes`` after the
-        # placement-feedback loop returns.  ``get_failed_nets()`` derives
-        # solely from ``self.router.routes`` (core.py:8320), so restoring
-        # the routes is sufficient to make the reported failed-net count
-        # consistent with the restored snapshot.
+        # of the best snapshot.  ``get_failed_nets()`` derives solely from
+        # ``self.router.routes`` (core.py:8320), so that alone makes the
+        # reported failed-net count consistent with the snapshot.
+        #
+        # Issue #4468: the grid IS also rebuilt now.  The original note here
+        # claimed "no caller relies on grid state after the loop returns" --
+        # board-07 disproved it: the CLI's trace optimize builds its collision
+        # checker from ``router.grid``, and the DRC nudge and pre-save
+        # clearance validation read it too, so a grid still describing the
+        # discarded iteration silently degrades the copper the loop just
+        # promised to restore (measured there as a lost net after optimize).
         #
         # Issue #3504: ALSO restore the component placement captured
         # alongside the routes.  The restored routes were computed against
@@ -606,9 +609,11 @@ class PlacementFeedbackLoop:
             # Deep-copy the snapshot so the loop's internal best state
             # cannot be mutated through ``self.router.routes`` after
             # this call returns.
-            self.router.routes = copy.deepcopy(best_routes_snapshot)
             # Issue #3504: restore the placement those routes belong to.
+            # Placement first, so the grid rebuild below re-adds the pads at
+            # the coordinates the restored routes were computed against.
             self._restore_placement(best_placement_snapshot)
+            self._rebuild_grid_for_routes(copy.deepcopy(best_routes_snapshot))
 
         # Final failure analysis -- computed AFTER restoration so the
         # result reflects the restored state, not the live last-iteration
@@ -638,6 +643,40 @@ class PlacementFeedbackLoop:
     def _clear_routes(self) -> None:
         """Clear all routes and reset the routing grid."""
         self.router._reset_for_new_trial()
+
+    def _rebuild_grid_for_routes(self, routes: list[Route]) -> None:
+        """Re-derive the routing grid from the CURRENT pads + *routes* (issue #4468).
+
+        Restoring ``router.routes`` and the pad coordinates is not a complete
+        revert: the routing **grid** still carries the occupancy and clearance
+        halos of the reverted attempt.  Nothing inside the loop notices (the next
+        pass calls ``_clear_routes`` first), but everything the CLI runs AFTER
+        the loop does -- trace optimize builds its collision checker from
+        ``router.grid``, and the DRC nudge and pre-save clearance validation read
+        it too.  Measured on board-07: with a stale grid the reverted run
+        optimized to 1096 segments and lost a net to the post-optimize
+        cross-net-short backstop (25/31) where the untouched baseline optimized
+        the SAME raw copper to 708 segments and kept 26/31.
+
+        Rebuilding is the same two steps the router itself performs between
+        trials: reset the grid from the (restored) pads, then re-mark every
+        restored route.  A router without those internals (test doubles) is left
+        alone -- the loop's own semantics do not depend on the grid.
+        """
+        reset = getattr(self.router, "_reset_for_new_trial", None)
+        mark = getattr(self.router, "_mark_route", None)
+        if reset is not None and mark is not None:
+            try:
+                reset()
+                for route in routes:
+                    mark(route)
+            except Exception as exc:  # pragma: no cover - defensive only
+                if self.verbose:
+                    print(f"  Warning: could not rebuild the routing grid after revert ({exc})")
+        # Assigned last (and unconditionally): ``_reset_for_new_trial`` clears
+        # ``router.routes``, and a router without the grid internals still owes
+        # the caller the restored routes.
+        self.router.routes = routes
 
     def _find_best_placement_strategy(
         self,
@@ -1099,6 +1138,13 @@ class PlacementDeltaFeedbackResult:
     proposed_deltas: list[PlacementDelta] = field(default_factory=list)
     skipped_deltas: list[PlacementDelta] = field(default_factory=list)
     skip_reasons: list[str] = field(default_factory=list)
+    # Issue #4468: probes that WERE applied and re-routed but did not strictly
+    # improve reach, with their measured before/after routed-net counts.  A
+    # skipped delta was never tried; a reverted one was, and the measurement is
+    # the evidence for "the loop plateaued here".
+    reverted_deltas: list[PlacementDelta] = field(default_factory=list)
+    reverted_counts: list[tuple[int, int]] = field(default_factory=list)
+    reverted_reasons: list[str] = field(default_factory=list)
     failed_nets: list[int] = field(default_factory=list)
     placement_diff: list[PlacementDiffEntry] = field(default_factory=list)
     exit_reason: str = "pd_max_iter"
@@ -1112,20 +1158,67 @@ class PlacementDeltaFeedbackResult:
             f"  Routes: {len(self.routes)}",
             f"  Deltas proposed: {len(self.proposed_deltas)}",
             f"  Deltas kept:     {len(self.applied_deltas)}",
+            f"  Deltas reverted: {len(self.reverted_deltas)}",
             f"  Deltas skipped:  {len(self.skipped_deltas)}",
             f"  Failed nets: {len(self.failed_nets)}",
         ]
         for delta in self.applied_deltas:
             lines.append(f"    kept: {delta.target_ref} {delta.kind} ({delta.net_name})")
+        for delta, counts, reason in zip(
+            self.reverted_deltas,
+            self.reverted_counts,
+            self.reverted_reasons or [""] * len(self.reverted_deltas),
+            strict=False,
+        ):
+            lines.append(
+                f"    reverted: {delta.target_ref} {delta.kind} ({delta.net_name}) "
+                f"-- routed {counts[0]} -> {counts[1]}" + (f" ({reason})" if reason else "")
+            )
         for delta, reason in zip(self.skipped_deltas, self.skip_reasons, strict=False):
             lines.append(f"    skipped: {delta.target_ref} {delta.kind} -- {reason}")
         return "\n".join(lines)
+
+    def reverted_evidence(self) -> list[dict[str, Any]]:
+        """Serializable ``reverted`` payload for the delta artifact (#4468)."""
+        out: list[dict[str, Any]] = []
+        for delta, counts, reason in zip(
+            self.reverted_deltas,
+            self.reverted_counts,
+            self.reverted_reasons or [""] * len(self.reverted_deltas),
+            strict=False,
+        ):
+            entry = delta.to_dict()
+            entry["routed_before"] = counts[0]
+            entry["routed_after"] = counts[1]
+            entry["revert_reason"] = reason
+            out.append(entry)
+        return out
+
+
+def _delta_key(delta: PlacementDelta) -> tuple[str, str, float, float, float]:
+    """Identity of the MOVE a delta encodes (issue #4468).
+
+    Two diagnoses often propose the identical move -- board-07's DQ3 and DQ4
+    both ask for the same 180-degree rotation of U2 -- and a reverted probe
+    leaves the board where the classifier will propose it again.  Keying on the
+    geometry (not the net or the target alone) makes "already probed" mean
+    "this exact placement change was tried", so two different translates of the
+    same part remain two distinct probes.
+    """
+    return (
+        delta.target_ref,
+        delta.kind,
+        round(delta.dx, 4),
+        round(delta.dy, 4),
+        round(delta.rotation_delta, 4),
+    )
 
 
 def write_placement_delta_json(
     path: str | Path,
     applied: list[PlacementDelta],
     proposed: list[PlacementDelta],
+    reverted: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Write the ``<output>_placement_delta.json`` artifact (issue #4467).
 
@@ -1133,10 +1226,17 @@ def write_placement_delta_json(
     :meth:`PlacementDelta.to_dict` so a propose-only recipe can reload them with
     :meth:`PlacementDelta.from_dict` and apply them deterministically without
     re-running the loop.  Returns the serialized dict for convenience/testing.
+
+    Issue #4468 adds ``reverted``: the probes that were actually applied and
+    re-routed but did not strictly improve reach, each with its measured
+    before/after routed-net count.  Without it a run that keeps nothing is
+    indistinguishable from a run that never tried, which is exactly the
+    evidence a "the loop plateaued here" claim needs.
     """
     data = {
         "applied": [d.to_dict() for d in applied],
         "proposed": [d.to_dict() for d in proposed],
+        "reverted": list(reverted or []),
     }
     Path(path).write_text(json.dumps(data, indent=2))
     return data
@@ -1187,6 +1287,7 @@ class PlacementDeltaFeedbackLoop(PlacementFeedbackLoop):
         fixed_refs: set[str] | list[str] | None = None,
         max_movement: float | None = 5.0,
         delta_proposer: Callable[[PCB], list[PlacementDelta]] | None = None,
+        excluded_nets: frozenset[str] | set[str] | list[str] | None = None,
     ):
         super().__init__(
             router=router,
@@ -1199,11 +1300,73 @@ class PlacementDeltaFeedbackLoop(PlacementFeedbackLoop):
         # without constructing a full classifier fixture.  Defaults to the real
         # classifier -> translator pipeline.
         self._delta_proposer = delta_proposer
+        # Nets the router was told to skip (pour/plane nets).  They are carried
+        # by copper fill rather than traces, so classifying them as stuck signal
+        # nets would propose placement moves for a non-problem (issue #4468).
+        self.excluded_nets: frozenset[str] = frozenset(excluded_nets or ())
 
     # --- delta proposal / selection ----------------------------------------
 
+    def _routed_pcb_view(self) -> PCB | None:
+        """Materialize ``self.pcb`` + the router's CURRENT copper for classification.
+
+        Issue #4468 (the composed-path gap Phase 2 could not see with a
+        ``FakeRouter``): the stuck-net classifier is a *routed-board*
+        diagnostic.  It reads ``NetStatusAnalyzer`` for the incomplete nets and
+        the committed segments/vias for the blocker geometry that separates
+        ``CONGESTION_SATURATED`` from ``PLACEMENT_BOUND``.  ``self.pcb`` is the
+        **unrouted** input board (the CLI loads it from the staged input so the
+        loop can mutate footprints), so classifying it directly reports every
+        signal net as stuck with zero blockers -- the diagnosis, and therefore
+        every proposed delta, would describe a board that does not exist.
+
+        This builds a throwaway view: the live placement (including any delta
+        applied so far) serialized out, the router's current routes merged in,
+        re-parsed.  Read-only with respect to ``self.pcb`` -- the returned PCB
+        is never the object the applicator mutates.
+
+        Returns ``self.pcb`` unchanged when the router has no routes yet (there
+        is nothing to merge) or when the view cannot be built, so the loop
+        degrades to the pre-#4468 behavior instead of failing.
+        """
+        if self.pcb is None:
+            return None
+        routes = getattr(self.router, "routes", None)
+        if not routes:
+            return self.pcb
+
+        import tempfile
+
+        from kicad_tools.router.io import merge_routes_into_pcb
+        from kicad_tools.schema.pcb import PCB as _PCB
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="kct-placement-delta-") as tmpdir:
+                placement_path = Path(tmpdir) / "placement.kicad_pcb"
+                self.pcb.save(placement_path)
+                # A board that already carries copper (``--preserve-existing``
+                # style inputs) would otherwise end up with the router's routes
+                # merged ON TOP of the stale copper, double-counting geometry.
+                if self.pcb.segments or self.pcb.vias:
+                    staged = _PCB.load(placement_path)
+                    staged.strip_traces(keep_zones=True)
+                    staged.save(placement_path)
+                text = placement_path.read_text()
+                # Issue #4416 dialect parity: emit ``(net "NAME")`` copper for a
+                # name-only board so the merged view parses back with net
+                # attribution intact.
+                name_only = bool(getattr(self.pcb, "_net_name_only_dialect", False))
+                route_sexp = self.router.to_sexp(skip_cleanup=True, name_only=name_only)
+                view_path = Path(tmpdir) / "routed_view.kicad_pcb"
+                view_path.write_text(merge_routes_into_pcb(text, route_sexp))
+                return _PCB.load(view_path)
+        except Exception as exc:  # pragma: no cover - defensive only
+            if self.verbose:
+                print(f"  Warning: could not build routed view for classification ({exc})")
+            return self.pcb
+
     def _propose_deltas(self) -> list[PlacementDelta]:
-        """Classify the current PCB and translate diagnoses into deltas."""
+        """Classify the current routed state and translate diagnoses into deltas."""
         if self.pcb is None:
             return []
         if self._delta_proposer is not None:
@@ -1211,8 +1374,11 @@ class PlacementDeltaFeedbackLoop(PlacementFeedbackLoop):
         from kicad_tools.router.placement_delta import deltas_from_result
         from kicad_tools.router.stuck_classifier import classify_stuck_nets_from_pcb
 
-        result = classify_stuck_nets_from_pcb(self.pcb)
-        return deltas_from_result(self.pcb, result)
+        view = self._routed_pcb_view()
+        if view is None:
+            return []
+        result = classify_stuck_nets_from_pcb(view, excluded_nets=self.excluded_nets)
+        return deltas_from_result(view, result)
 
     def _strategy_from_delta(self, delta: PlacementDelta) -> ResolutionStrategy | None:
         """Build a recovery ``ResolutionStrategy`` for an applyable delta.
@@ -1318,16 +1484,27 @@ class PlacementDeltaFeedbackLoop(PlacementFeedbackLoop):
         return [(pad, pad.x, pad.y) for pad in self._router_pads()]
 
     def _restore_router_pads(self, snapshot: list[tuple[Any, float, float]]) -> None:
-        """Restore router Pad coordinates captured by :meth:`_snapshot_router_pads`.
-
-        Only pad coordinates are restored -- the routing grid is rebuilt from
-        these coordinates by ``_clear_routes`` at the top of the next routing
-        pass, so no explicit grid reset is needed here (and the final best-state
-        restore does not re-route).
-        """
+        """Restore router Pad coordinates captured by :meth:`_snapshot_router_pads`."""
         for pad, x, y in snapshot:
             pad.x = x
             pad.y = y
+
+    def _clearance_violation_count(self) -> int | None:
+        """Router-level clearance-violation count, or ``None`` when unavailable.
+
+        The same lightweight pre-save validator the CLI runs before writing the
+        routed board (:func:`kicad_tools.router.io.validate_routes`), so the
+        loop's accept/reject decision is measured with the same instrument the
+        pipeline will judge the output by.  Returns ``None`` for routers without
+        the state the validator needs (test doubles), which disables the
+        no-regression guard rather than failing the loop.
+        """
+        try:
+            from kicad_tools.router.io import validate_routes
+
+            return len(validate_routes(self.router))
+        except Exception:
+            return None
 
     def _apply_delta_to_router_pads(self, delta: PlacementDelta) -> None:
         """Mutate the router's flat pad coordinates to match an applied delta.
@@ -1367,6 +1544,8 @@ class PlacementDeltaFeedbackLoop(PlacementFeedbackLoop):
         use_negotiated: bool = True,
         timeout: float | None = None,
         per_net_timeout: float | None = None,
+        reuse_existing_routes: bool = False,
+        require_no_clearance_regression: bool = True,
     ) -> PlacementDeltaFeedbackResult:
         """Run the classifier-driven placement-delta feedback loop.
 
@@ -1377,6 +1556,22 @@ class PlacementDeltaFeedbackLoop(PlacementFeedbackLoop):
                 ``route_all``) for every routing pass.
             timeout / per_net_timeout: Forwarded to the negotiated router so each
                 re-route respects the caller's wall-clock budget.
+            reuse_existing_routes: When True and the router already carries
+                routes, adopt them as the baseline instead of re-routing from
+                scratch (issue #4468).  The CLI invokes this loop immediately
+                after a completed routing pass, so the baseline re-route is a
+                full duplicate of work already done -- on board-07 that is
+                ~11 min of wall clock for a bit-identical result.  Leave False
+                (the default) when the caller has not routed yet.
+            require_no_clearance_regression: Keep a delta only if it ALSO does
+                not increase the router's clearance-violation count (issue
+                #4468).  Reach alone is the wrong acceptance test for a
+                placement change: measured on board-07, a kept 2 mm translate
+                bought one net (26/31 -> 27/31) while pushing two DDR-channel
+                clearances under the jlcpcb floor and breaking the ADDR_BUS
+                length-match the board exists to exercise -- a trade the
+                routed-DRC allowlist would have had to be WIDENED to absorb.
+                Set False to restore the reach-only Phase-2 criterion.
 
         Returns:
             A :class:`PlacementDeltaFeedbackResult`.  The returned routes/placement
@@ -1404,6 +1599,9 @@ class PlacementDeltaFeedbackLoop(PlacementFeedbackLoop):
         proposed: list[PlacementDelta] = []
         skipped: list[PlacementDelta] = []
         skip_reasons: list[str] = []
+        reverted: list[PlacementDelta] = []
+        reverted_counts: list[tuple[int, int]] = []
+        reverted_reasons: list[str] = []
 
         if self.verbose:
             print("\n=== Placement-Delta Feedback Loop (classifier-driven) ===")
@@ -1413,8 +1611,13 @@ class PlacementDeltaFeedbackLoop(PlacementFeedbackLoop):
             if self.max_movement is not None:
                 print(f"  Max movement:    {self.max_movement:.2f}mm")
 
-        # Initial routing pass establishes the baseline / best state.
-        _route()
+        # Initial routing pass establishes the baseline / best state.  When the
+        # caller already routed (the CLI path), reuse that state verbatim.
+        if reuse_existing_routes and getattr(self.router, "routes", None):
+            if self.verbose:
+                print("  Reusing the caller's existing routes as the baseline (no re-route)")
+        else:
+            _route()
         total_nets = len(self.router.nets) - 1
         best_count = _routed_count()
         best_routes = copy.deepcopy(list(self.router.routes))
@@ -1426,6 +1629,12 @@ class PlacementDeltaFeedbackLoop(PlacementFeedbackLoop):
 
         exit_reason = "pd_max_iter"
         iteration = 0
+        # Moves already probed.  A reverted delta puts the board back exactly
+        # where it was, so the classifier re-proposes the SAME ladder on the
+        # next iteration; without this the loop would probe one candidate
+        # forever.  Keyed on the move itself (not the target) so two different
+        # translates of one part are two distinct probes (issue #4468).
+        probed: set[tuple[str, str, float, float, float]] = set()
         for iteration in range(max_adjustments):
             if not self.router.get_failed_nets():
                 exit_reason = "pd_converged"
@@ -1436,13 +1645,18 @@ class PlacementDeltaFeedbackLoop(PlacementFeedbackLoop):
 
             deltas = self._propose_deltas()
             proposed.extend(deltas)
-            selection = self._select_delta(deltas, skipped, skip_reasons)
+            candidates = [d for d in deltas if _delta_key(d) not in probed]
+            selection = self._select_delta(candidates, skipped, skip_reasons)
             if selection is None:
-                exit_reason = "pd_no_delta"
+                # A revert already recorded the loop's outcome; running out of
+                # UNPROBED candidates afterwards does not change it.
+                if exit_reason != "pd_reverted":
+                    exit_reason = "pd_no_delta"
                 if self.verbose:
                     print("  No applyable placement delta; stopping.")
                 break
             delta, strategy = selection
+            probed.add(_delta_key(delta))
 
             # Snapshot the pre-apply state so a non-improving delta reverts
             # atomically (placement + router pads + routes together).
@@ -1450,6 +1664,7 @@ class PlacementDeltaFeedbackLoop(PlacementFeedbackLoop):
             pre_pads = self._snapshot_router_pads()
             pre_routes = copy.deepcopy(list(self.router.routes))
             pre_count = _routed_count()
+            pre_violations = self._clearance_violation_count()
 
             # Record the pre-move position (once) for the placement diff.
             self._snapshot_positions([delta.target_ref])
@@ -1471,8 +1686,16 @@ class PlacementDeltaFeedbackLoop(PlacementFeedbackLoop):
 
             _route()
             new_count = _routed_count()
+            post_violations = self._clearance_violation_count()
 
-            if new_count > pre_count:
+            regressed_drc = (
+                require_no_clearance_regression
+                and pre_violations is not None
+                and post_violations is not None
+                and post_violations > pre_violations
+            )
+
+            if new_count > pre_count and not regressed_drc:
                 applied.append(delta)
                 if self.verbose:
                     print(f"  Kept: routed {pre_count} -> {new_count} (strict improvement)")
@@ -1482,25 +1705,45 @@ class PlacementDeltaFeedbackLoop(PlacementFeedbackLoop):
                     best_placement = self._snapshot_placement()
                     best_pads = self._snapshot_router_pads()
             else:
-                # Revert atomically: placement, router pads, and routes.
+                # Revert atomically: placement, router pads, routes AND the
+                # routing grid (issue #4468 -- the CLI's post-loop optimize /
+                # DRC-nudge / clearance stages all read ``router.grid``, so a
+                # grid still holding the reverted attempt's occupancy silently
+                # degrades the output the loop just promised to leave untouched).
                 self._restore_placement(pre_placement)
                 self._restore_router_pads(pre_pads)
-                self.router.routes = pre_routes
+                self._rebuild_grid_for_routes(pre_routes)
+                reason = (
+                    f"clearance violations {pre_violations} -> {post_violations}"
+                    if regressed_drc
+                    else "no strict routed-net increase"
+                )
+                reverted.append(delta)
+                reverted_counts.append((pre_count, new_count))
+                reverted_reasons.append(reason)
                 exit_reason = "pd_reverted"
                 if self.verbose:
                     print(
                         f"  Reverted: routed {pre_count} -> {new_count} "
-                        f"(no strict improvement); placement + routes restored"
+                        f"({reason}); placement + routes + grid restored"
                     )
-                break
+                # Continue with the NEXT unprobed candidate while budget
+                # remains (issue #4468): the classifier ranks a LADDER, and
+                # the top rung failing says nothing about the rungs below it.
+                # The keep-if-improves guarantee is unchanged -- every probe
+                # still has to beat the baseline to survive -- so a wider
+                # search costs wall clock, never reach.  ``max_adjustments``
+                # is the bound; callers that want the old stop-at-first-revert
+                # behaviour pass ``max_adjustments=1``.
+                continue
 
-        # Restore the best observed state (routes + placement + router pads
-        # together) so the returned result is monotone in routed-net count.
+        # Restore the best observed state (routes + placement + router pads +
+        # grid together) so the returned result is monotone in routed-net count.
         current_count = _routed_count()
         if best_count > current_count:
-            self.router.routes = copy.deepcopy(best_routes)
             self._restore_placement(best_placement)
             self._restore_router_pads(best_pads)
+            self._rebuild_grid_for_routes(copy.deepcopy(best_routes))
 
         failed_nets = self.router.get_failed_nets()
         if self.verbose:
@@ -1517,6 +1760,9 @@ class PlacementDeltaFeedbackLoop(PlacementFeedbackLoop):
             proposed_deltas=proposed,
             skipped_deltas=skipped,
             skip_reasons=skip_reasons,
+            reverted_deltas=reverted,
+            reverted_counts=reverted_counts,
+            reverted_reasons=reverted_reasons,
             failed_nets=failed_nets,
             placement_diff=self._build_placement_diff(),
             exit_reason=exit_reason,
