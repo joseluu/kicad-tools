@@ -1446,7 +1446,9 @@ def _shadow_setup(spacing_cells: int, bend_end: tuple[float, float]):
     return dpr, pair, spec, pathfinder, guide
 
 
-def _stub_tail_route(self, _pf, head, goal, _layer, _label, _name, partner_segments=None):
+def _stub_tail_route(
+    self, _pf, head, goal, _layer, _label, _name, partner_segments=None, prefer_planar=False
+):
     """Degenerate body-anchor tail (isolates the via geometry under test).
 
     Routing the real pad-reaching tail would have a straight fake tail
@@ -1927,6 +1929,9 @@ class _AllClearPathfinder:
         return self._width
 
     def _is_cell_blocked(self, gx: int, gy: int, layer_idx: int, net: int) -> bool:
+        return False
+
+    def _is_via_blocked(self, gx: int, gy: int, net: int) -> bool:
         return False
 
 
@@ -3080,3 +3085,648 @@ def test_route_is_chained_rejects_a_subcell_hole():
     # Closing the 5 um hole makes it a chain again.
     route.segments[1].x1 = 1.0
     assert dpr._route_is_chained(route, head, goal) is True
+
+
+# ---------------------------------------------------------------------------
+# Issue #4570: via-count symmetry between the two legs of a constructed pair.
+#
+# ``diffpair_length_skew`` measures ELECTRICAL length -- planar copper plus
+# each via's drilled length -- while the constructor's length matcher is planar
+# only.  A pair whose two legs carry different vias can therefore be driven to
+# a ~0.01 mm planar delta and still ship a multi-millimetre skew violation
+# (board-06 seed 42: 2 x 1.6 mm of unmatched through-via on PCIE_RX /
+# USB3_TX1).  The constructor now measures a thickness-free per-leg via
+# signature, asks the landing tails to stay planar when the partner leg has no
+# via to match, and DECLINES the side rather than shipping the asymmetry.
+# ---------------------------------------------------------------------------
+
+
+def _via(layers, x=1.0, y=1.0, net=1, is_micro=False) -> Via:
+    return Via(
+        x=x,
+        y=y,
+        drill=0.3,
+        diameter=0.6,
+        layers=layers,
+        net=net,
+        net_name="P",
+        is_micro=is_micro,
+    )
+
+
+def _planar_leg(length: float = 10.0, net: int = 1) -> Route:
+    r = Route(net=net, net_name="P")
+    r.segments.append(
+        Segment(
+            x1=0.0, y1=0.0, x2=length, y2=0.0, width=0.2, layer=Layer.F_CU, net=net, net_name="P"
+        )
+    )
+    return r
+
+
+def test_via_signature_is_zero_for_a_planar_route():
+    from kicad_tools.router.diffpair_routing import _route_via_signature
+
+    assert _route_via_signature(_planar_leg(), 4) == (0, 0)
+    assert _route_via_signature(None, 4) == (0, 0)
+
+
+def test_via_signature_counts_both_vias_and_their_stack_spans():
+    """The measured board-06 tail case: two full F.Cu->B.Cu through-vias."""
+    from kicad_tools.router.diffpair_routing import _route_via_signature
+
+    leg = _planar_leg()
+    leg.vias.append(_via((Layer.F_CU, Layer.B_CU)))
+    leg.vias.append(_via((Layer.F_CU, Layer.B_CU), x=5.0))
+
+    # 4-layer stack: F.Cu -> B.Cu spans 3 stack positions.
+    assert _route_via_signature(leg, 4) == (2, 6)
+    # ...and 1 on a 2-layer stack: the signature follows the STACK, not the
+    # KiCad layer enum (which would call F.Cu->B.Cu a 5-layer span either way).
+    assert _route_via_signature(leg, 2) == (2, 2)
+
+
+def test_via_signature_separates_a_blind_via_from_a_through_via():
+    """The span sum -- not just the count -- is what has to match (#4570 AC)."""
+    from kicad_tools.router.diffpair_routing import _route_via_signature
+
+    blind = _planar_leg()
+    blind.vias.append(_via((Layer.F_CU, Layer.IN1_CU), is_micro=True))
+    through = _planar_leg()
+    through.vias.append(_via((Layer.F_CU, Layer.B_CU)))
+
+    assert _route_via_signature(blind, 4) == (1, 1)
+    assert _route_via_signature(through, 4) == (1, 3)
+    assert _route_via_signature(blind, 4) != _route_via_signature(through, 4)
+
+
+@pytest.mark.parametrize("thickness", [0.6, 1.0, 1.6, 2.4])
+@pytest.mark.parametrize("blind_buried", [True, False])
+def test_equal_via_signatures_cancel_the_skew_rule_via_term(thickness, blind_buried):
+    """The thickness-free claim, asserted against the checker's own model.
+
+    Two legs whose ``(via count, sum |delta stack index|)`` signatures agree
+    contribute EQUAL via length under ``DiffPairLengthTracker._measure_route``
+    -- the exact measurement ``diffpair_length_skew`` performs -- for any
+    ``board_thickness_mm`` and with or without through-via promotion (#4007).
+    That is why the constructor can enforce z-length symmetry without a
+    thickness source (the router's ``DesignRules`` carries none).
+    """
+    from kicad_tools.router.diffpair_length import DiffPairLengthTracker
+    from kicad_tools.router.diffpair_routing import _route_via_signature
+
+    leg_a = _planar_leg()
+    leg_a.vias.append(_via((Layer.F_CU, Layer.B_CU)))
+    leg_a.vias.append(_via((Layer.IN1_CU, Layer.IN2_CU), x=4.0))
+    # Same signature, different placement/order.
+    leg_b = _planar_leg()
+    leg_b.vias.append(_via((Layer.IN2_CU, Layer.IN1_CU), x=7.0))
+    leg_b.vias.append(_via((Layer.B_CU, Layer.F_CU), x=2.0))
+
+    assert _route_via_signature(leg_a, 4) == _route_via_signature(leg_b, 4)
+
+    len_a = DiffPairLengthTracker._measure_route(
+        leg_a, thickness, 4, blind_buried_supported=blind_buried
+    )
+    len_b = DiffPairLengthTracker._measure_route(
+        leg_b, thickness, 4, blind_buried_supported=blind_buried
+    )
+    assert abs(len_a - len_b) < 1e-9
+
+
+def test_unequal_via_signatures_are_exactly_the_measured_board06_skew():
+    """0 vias vs 2 through-vias on a 1.6 mm 4-layer board = 3.2 mm of skew."""
+    from kicad_tools.router.diffpair_length import DiffPairLengthTracker
+    from kicad_tools.router.diffpair_routing import _route_via_signature
+
+    guide_leg = _planar_leg()
+    shadow_leg = _planar_leg()
+    shadow_leg.vias.append(_via((Layer.F_CU, Layer.B_CU)))
+    shadow_leg.vias.append(_via((Layer.F_CU, Layer.B_CU), x=5.0))
+
+    assert _route_via_signature(guide_leg, 4) != _route_via_signature(shadow_leg, 4)
+    skew = DiffPairLengthTracker._measure_route(
+        shadow_leg, 1.6, 4, blind_buried_supported=False
+    ) - DiffPairLengthTracker._measure_route(guide_leg, 1.6, 4, blind_buried_supported=False)
+    assert abs(skew - 3.2) < 1e-9
+
+
+def test_via_signature_tolerates_an_odd_via_count_without_crashing():
+    """A single-via leg is physically odd but must not break the gate."""
+    from kicad_tools.router.diffpair_routing import _route_via_signature
+
+    leg = _planar_leg()
+    leg.vias.append(_via((Layer.F_CU, Layer.B_CU)))
+    assert _route_via_signature(leg, 4) == (1, 3)
+
+
+# ---------------------------------------------------------------------------
+# Remediation A: the planar-preferred landing tail.
+# ---------------------------------------------------------------------------
+
+
+class _FakeRouterLayerLock:
+    """Records ``set_routable_layers`` calls so the lock can be asserted."""
+
+    def __init__(self, layers):
+        self._routable_layers = list(layers)
+        self.calls: list[list[int]] = []
+
+    def set_routable_layers(self, layers):
+        self.calls.append(list(layers))
+        self._routable_layers = list(layers)
+
+
+def _diving_route(net=2) -> Route:
+    r = Route(net=net, net_name="USB3_TX1-")
+    r.segments.append(
+        Segment(x1=0.0, y1=0.0, x2=2.0, y2=0.0, width=0.2, layer=Layer.F_CU, net=net, net_name="N")
+    )
+    r.segments.append(
+        Segment(x1=2.0, y1=0.0, x2=4.0, y2=0.0, width=0.2, layer=Layer.B_CU, net=net, net_name="N")
+    )
+    r.vias.append(_via((Layer.F_CU, Layer.B_CU), x=2.0, y=0.0, net=net))
+    return r
+
+
+def _planar_route(net=2) -> Route:
+    r = Route(net=net, net_name="USB3_TX1-")
+    r.segments.append(
+        Segment(x1=0.0, y1=0.0, x2=4.0, y2=0.5, width=0.2, layer=Layer.F_CU, net=net, net_name="N")
+    )
+    return r
+
+
+def _fallback_tail_probe_spy(dpr, monkeypatch, fake_router):
+    """Wire a scripted ``_single_ended_guide_route`` onto ``dpr``.
+
+    Returns the diving route while the router is unlocked and a planar one
+    while it is locked -- i.e. exactly the board-06 situation the planar
+    preference exists for.
+    """
+    monkeypatch.setattr(dpr.autorouter, "router", fake_router, raising=False)
+    monkeypatch.setattr(dpr, "_route_pad_violation", lambda route: (0.0, None), raising=False)
+
+    def _probe(head, goal, per_net_timeout=None, avoid_locations=None, avoid_radius_cells=1):
+        locked = fake_router._routable_layers == [0]
+        return _planar_route() if locked else _diving_route()
+
+    monkeypatch.setattr(dpr, "_single_ended_guide_route", _probe, raising=False)
+
+
+def test_planar_preference_displaces_a_diving_astar_tail(monkeypatch):
+    """The via-inventing A* tail is replaced by a layer-locked planar one."""
+    dpr = _diffpair_router()
+    fake_router = _FakeRouterLayerLock([0, 1])
+    _fallback_tail_probe_spy(dpr, monkeypatch, fake_router)
+    head, goal = _tail_pads((0.0, 0.0), (4.0, 0.5))
+
+    tail = dpr._fallback_tail_route(head, goal, None, 0.0, prefer_planar_layer=0)
+
+    assert tail is not None
+    assert tail.vias == [], "a planar tail was available; the dive must not ship"
+    # The lock was applied and then RESTORED (a leaked narrowing would forbid
+    # vias for every remaining net on the board).
+    assert fake_router.calls == [[0], [0, 1]]
+    assert fake_router._routable_layers == [0, 1]
+
+
+def test_planar_preference_is_not_attempted_without_the_flag(monkeypatch):
+    """Default (and the only shadow-OFF-reachable) path: no extra probe."""
+    dpr = _diffpair_router()
+    fake_router = _FakeRouterLayerLock([0, 1])
+    _fallback_tail_probe_spy(dpr, monkeypatch, fake_router)
+    head, goal = _tail_pads((0.0, 0.0), (4.0, 0.5))
+
+    tail = dpr._fallback_tail_route(head, goal, None, 0.0)
+
+    assert tail is not None
+    assert tail.vias, "the legacy chain returns the unbiased (diving) probe"
+    assert fake_router.calls == [], "the router must not be touched at all"
+
+
+def test_planar_preference_keeps_the_dive_when_no_planar_tail_is_legal(monkeypatch):
+    """A planar candidate that fails the exact pad predicate is REJECTED.
+
+    The remediation may never bypass the gates the rest of the constructed
+    copper passes (#4571's lesson).  When the planar probe's copper violates
+    them the diving tail is kept and the caller's symmetry gate -- not this
+    function -- decides the side's fate.
+    """
+    dpr = _diffpair_router()
+    fake_router = _FakeRouterLayerLock([0, 1])
+    _fallback_tail_probe_spy(dpr, monkeypatch, fake_router)
+    # Every PLANAR candidate violates the exact foreign-pad predicate.
+    monkeypatch.setattr(
+        dpr,
+        "_route_pad_violation",
+        lambda route: ((0.5, (1.0, 1.0)) if not route.vias else (0.0, None)),
+        raising=False,
+    )
+    head, goal = _tail_pads((0.0, 0.0), (4.0, 0.5))
+
+    tail = dpr._fallback_tail_route(head, goal, None, 0.0, prefer_planar_layer=0)
+
+    assert tail is not None
+    assert tail.vias, "the rejected planar candidate must not displace the dive"
+    assert fake_router.calls == [[0], [0, 1]], "lock applied then restored"
+
+
+def test_layer_lock_is_a_noop_without_a_set_routable_layers_backend():
+    """The pure-Python backend has no layer vector: report the lock unavailable."""
+    dpr = _diffpair_router()
+
+    class _NoLockRouter:
+        pass
+
+    dpr.autorouter.router = _NoLockRouter()
+    with dpr._layer_locked_router(0) as locked:
+        assert locked is False
+
+
+def test_layer_lock_declines_a_layer_that_is_not_routable():
+    dpr = _diffpair_router()
+    fake_router = _FakeRouterLayerLock([0, 1])
+    dpr.autorouter.router = fake_router
+    with dpr._layer_locked_router(5) as locked:
+        assert locked is False
+    assert fake_router.calls == []
+
+
+# ---------------------------------------------------------------------------
+# The gate itself, driven through ``_shadow_route_pair``.
+# ---------------------------------------------------------------------------
+
+
+def _planar_guide(p_start_pad) -> Route:
+    """A straight, VIA-FREE F.Cu guide -- board-06's PCIE_RX / USB3_TX1 case."""
+    net, name = p_start_pad.net, p_start_pad.net_name
+    guide = Route(net=net, net_name=name)
+    guide.segments.append(
+        Segment(
+            x1=5.0, y1=4.8, x2=25.0, y2=4.8, width=0.2, layer=Layer.F_CU, net=net, net_name=name
+        )
+    )
+    return guide
+
+
+def _stub_tail_route_planar(
+    self, _pf, head, goal, _layer, _label, _name, partner_segments=None, prefer_planar=False
+):
+    """Degenerate planar body-anchor tail (see ``_stub_tail_route``)."""
+    r = Route(net=goal.net, net_name=goal.net_name)
+    r.segments.append(
+        Segment(
+            x1=head.x,
+            y1=head.y,
+            x2=head.x + 0.001,
+            y2=head.y,
+            width=0.2,
+            layer=head.layer,
+            net=goal.net,
+            net_name=goal.net_name,
+        )
+    )
+    return r
+
+
+def _stub_tail_route_diving(
+    self, _pf, head, goal, _layer, _label, _name, partner_segments=None, prefer_planar=False
+):
+    """A stub tail that dives -- the unmatched via #4570 is about."""
+    r = _stub_tail_route_planar(
+        self, _pf, head, goal, _layer, _label, _name, partner_segments, prefer_planar
+    )
+    r.vias.append(
+        Via(
+            x=head.x,
+            y=head.y,
+            drill=0.3,
+            diameter=0.6,
+            layers=(Layer.F_CU, Layer.B_CU),
+            net=goal.net,
+            net_name=goal.net_name,
+        )
+    )
+    return r
+
+
+def _run_shadow_with_tails(monkeypatch, tail_stub):
+    from kicad_tools.router.diffpair_routing import DiffPairRouter
+
+    spacing_cells = 4
+    dpr, pair, spec, pathfinder, _ = _shadow_setup(spacing_cells, bend_end=(11.0, 7.7))
+    guide = _planar_guide(spec.p_start)
+    monkeypatch.setattr(DiffPairRouter, "_tail_route", tail_stub, raising=True)
+    monkeypatch.setattr(
+        DiffPairRouter, "_pair_has_physical_overlap", lambda self, p, n: False, raising=True
+    )
+    result = dpr._shadow_route_pair(pair, spec, pathfinder, guide, spacing_cells)
+    return dpr, result
+
+
+def test_shadow_pair_with_symmetric_planar_legs_is_accepted(monkeypatch):
+    """Control: a via-free guide plus via-free tails passes the gate."""
+    dpr, result = _run_shadow_with_tails(monkeypatch, _stub_tail_route_planar)
+
+    assert result is not None
+    p_route, n_route = result
+    assert p_route.vias == [] and n_route.vias == []
+    assert dpr._last_shadow_decline_reason != "via-skew"
+
+
+def test_shadow_pair_declines_when_only_one_leg_carries_a_via(monkeypatch):
+    """The #4570 defect under STRICT: 0 vias on the guide, 2 on the shadow.
+
+    Before the gate this pair SHIPPED -- the planar length matcher drove it to
+    a sub-hundredth-mm planar delta and reported success while
+    ``diffpair_length_skew`` measured 3.19 mm.  Under
+    ``KCT_SHADOW_VIA_SYMMETRY_STRICT`` the pair is dropped instead, with a
+    reason distinct from ``overlap`` / ``blockage``.
+    """
+    import kicad_tools.router.diffpair_routing as dpr_mod
+
+    monkeypatch.setattr(dpr_mod, "_SHADOW_VIA_SYMMETRY_STRICT", True, raising=True)
+    dpr, result = _run_shadow_with_tails(monkeypatch, _stub_tail_route_diving)
+
+    assert result is None, "strict mode must not ship an asymmetric pair"
+    assert dpr._last_shadow_decline_reason == "via-skew"
+
+
+def test_shadow_pair_records_the_asymmetry_it_ships_by_default(monkeypatch):
+    """Default policy: the pair still ships, but never SILENTLY.
+
+    Dropping the pair costs a routed net on board-06 (measured: reach 19 -> 18,
+    and the "improved" DRC count is partly vacuity because
+    ``diffpair_length_skew`` only fires on an ENGAGED pair).  So the default
+    keeps the pair -- and records ``via-skew`` so the outcome is visible to the
+    #4459 taxonomy and to ``KCT_SHADOW_DEBUG``.
+    """
+    dpr, result = _run_shadow_with_tails(monkeypatch, _stub_tail_route_diving)
+
+    assert result is not None
+    assert dpr._last_shadow_decline_reason == "via-skew", (
+        "an asymmetric ship must still be recorded, not silent"
+    )
+
+
+def test_symmetric_side_beats_an_asymmetric_one(monkeypatch):
+    """The gate's cheapest win: prefer the offset side whose legs match.
+
+    ``asym_fallback`` is only consulted after BOTH sides have been tried, so a
+    side-``+1`` pair that dives can never displace a symmetric side-``-1`` one.
+    """
+    from kicad_tools.router.diffpair_routing import DiffPairRouter
+
+    seen: list[float] = []
+
+    def _tail(self, _pf, head, goal, _layer, _label, _name, partner_segments=None, **kw):
+        # Dive on the first side attempted, stay planar on the second.
+        first = not seen
+        if _label == "shadow-start":
+            seen.append(1.0)
+        stub = _stub_tail_route_diving if first else _stub_tail_route_planar
+        return stub(self, _pf, head, goal, _layer, _label, _name, partner_segments)
+
+    monkeypatch.setattr(DiffPairRouter, "_tail_route", _tail, raising=True)
+    monkeypatch.setattr(
+        DiffPairRouter, "_pair_has_physical_overlap", lambda self, p, n: False, raising=True
+    )
+    spacing_cells = 4
+    dpr, pair, spec, pathfinder, _ = _shadow_setup(spacing_cells, bend_end=(11.0, 7.7))
+    guide = _planar_guide(spec.p_start)
+
+    result = dpr._shadow_route_pair(pair, spec, pathfinder, guide, spacing_cells)
+
+    assert result is not None
+    p_route, n_route = result
+    assert p_route.vias == [] and n_route.vias == [], "the symmetric side must win"
+
+
+def test_shadow_via_symmetry_gate_honours_its_kill_switch(monkeypatch):
+    """``KCT_SHADOW_VIA_SYMMETRY=0`` restores the pre-#4570 behaviour exactly."""
+    import kicad_tools.router.diffpair_routing as dpr_mod
+
+    monkeypatch.setattr(dpr_mod, "_SHADOW_VIA_SYMMETRY", False, raising=True)
+    dpr, result = _run_shadow_with_tails(monkeypatch, _stub_tail_route_diving)
+
+    assert result is not None, "with the gate off the asymmetric pair ships as before"
+    assert dpr._last_shadow_decline_reason != "via-skew"
+
+
+def test_symmetric_two_via_legs_are_not_misdiagnosed(monkeypatch):
+    """Both legs dive (the deliberate polarity-swap crossover): leave it alone.
+
+    A crossing tail is a two-via construction BY DESIGN.  It is only a defect
+    when the partner leg has no counterpart, so a guide that carries the same
+    via signature must still be accepted.
+    """
+    from kicad_tools.router.diffpair_routing import _route_via_signature
+
+    guide_leg = _planar_leg()
+    guide_leg.vias.append(_via((Layer.F_CU, Layer.B_CU)))
+    guide_leg.vias.append(_via((Layer.B_CU, Layer.F_CU), x=6.0))
+    shadow_leg = _planar_leg(net=2)
+    shadow_leg.vias.append(_via((Layer.F_CU, Layer.B_CU), x=1.2, net=2))
+    shadow_leg.vias.append(_via((Layer.F_CU, Layer.B_CU), x=6.2, net=2))
+
+    assert _route_via_signature(guide_leg, 4) == _route_via_signature(shadow_leg, 4)
+
+
+# ---------------------------------------------------------------------------
+# Remediation B: the mirrored, centreline-preserving z-jog.
+# ---------------------------------------------------------------------------
+
+
+def _mirror_legs(dpr, partner_x_offset: float = 20.0):
+    """A long straight leg plus a partner far enough away to allow a mirror."""
+    net = 1
+    deficient = Route(net=net, net_name="USB_D+")
+    deficient.segments.append(
+        Segment(
+            x1=2.0, y1=2.0, x2=16.0, y2=2.0, width=0.2, layer=Layer.F_CU, net=net, net_name="USB_D+"
+        )
+    )
+    partner = Route(net=2, net_name="USB_D-")
+    partner.segments.append(
+        Segment(
+            x1=2.0,
+            y1=2.0 + partner_x_offset,
+            x2=16.0,
+            y2=2.0 + partner_x_offset,
+            width=0.2,
+            layer=Layer.F_CU,
+            net=2,
+            net_name="USB_D-",
+        )
+    )
+    partner.vias.append(_via((Layer.F_CU, Layer.B_CU), x=6.0, y=2.0 + partner_x_offset, net=2))
+    partner.vias.append(_via((Layer.F_CU, Layer.B_CU), x=9.0, y=2.0 + partner_x_offset, net=2))
+    return deficient, partner
+
+
+def test_mirrored_z_jog_matches_the_signature_without_moving_copper():
+    """The mirror equalises the drilled length without changing plan view.
+
+    The window is re-emitted on the other layer, so the leg's PLANAR length --
+    what ``_length_match_constructed_pair`` works on -- is untouched, and no
+    new angle is introduced (so the 45-census cannot regress).
+    """
+    from kicad_tools.router.diffpair_routing import _route_copper_length, _route_via_signature
+
+    dpr = _diffpair_router()
+    deficient, partner = _mirror_legs(dpr)
+    before_len = _route_copper_length(deficient)
+
+    ok = dpr._match_pair_via_signature(deficient, partner, _AllClearPathfinder(), 2)
+
+    assert ok is True
+    assert _route_via_signature(deficient, 2) == _route_via_signature(partner, 2)
+    assert abs(_route_copper_length(deficient) - before_len) < 1e-9
+    # Exactly one stretch changed layer, bracketed by the two new vias.
+    assert [s.layer for s in deficient.segments] == [Layer.F_CU, Layer.B_CU, Layer.F_CU]
+    assert len(deficient.vias) == 2
+    for v in deficient.vias:
+        assert v.layers == (Layer.F_CU, Layer.B_CU)
+
+
+def test_mirrored_z_jog_is_refused_when_the_barrel_would_graze_the_partner():
+    """A coupled body has no legal mirror site -- the barrel bound is ~0.6 mm.
+
+    This is why board-06's crossing-tail pairs cannot be repaired by mirroring:
+    the intra-pair gap is a tenth of the via-barrel-to-partner-copper bound, so
+    a centreline-preserving jog has nowhere to sit.
+    """
+    dpr = _diffpair_router()
+    deficient, partner = _mirror_legs(dpr, partner_x_offset=0.3)
+
+    assert dpr._match_pair_via_signature(deficient, partner, _AllClearPathfinder(), 2) is False
+    assert deficient.vias == [], "a refused mirror must not leave copper behind"
+
+
+def test_mirrored_z_jog_is_refused_over_a_foreign_pad():
+    """The mirror passes the exact foreign-pad predicate, not just the raster."""
+    dpr = _pad_gate_router()
+    deficient, partner = _mirror_legs(dpr)
+    # Drop a foreign pad on the middle of the leg, where the jog window sits.
+    dpr.autorouter.grid.add_pad(_pad_at(9.0, 2.0, net=99, name="OTHER"))
+
+    ok = dpr._match_pair_via_signature(deficient, partner, _AllClearPathfinder(), 2)
+
+    if ok:
+        # A legal window elsewhere on the leg is fine; what must never happen
+        # is a via inside the foreign pad's halo.
+        for v in deficient.vias:
+            assert dpr._via_pad_deficit(v) <= 1e-4
+    else:
+        assert deficient.vias == []
+
+
+def test_mirrored_z_jog_is_refused_when_the_partner_occupies_the_jog_layer():
+    """The relocated stretch is screened on the layer it MOVES TO.
+
+    The partner's own crossing tail dives to exactly the layer the jog lands
+    on, so a mirror that only checks the barrels leaves same-layer P/N copper
+    at a fraction of the clearance (measured: 12 extra
+    ``diffpair_clearance_intra`` errors on board-06 seed 42).
+    """
+    dpr = _diffpair_router()
+    deficient, partner = _mirror_legs(dpr)
+    # Partner copper laid directly over the jog window, on the jog's layer.
+    partner.segments.append(
+        Segment(
+            x1=2.0,
+            y1=2.05,
+            x2=16.0,
+            y2=2.05,
+            width=0.2,
+            layer=Layer.B_CU,
+            net=2,
+            net_name="USB_D-",
+        )
+    )
+
+    assert dpr._match_pair_via_signature(deficient, partner, _AllClearPathfinder(), 2) is False
+    assert deficient.vias == []
+
+
+def test_mirror_is_opt_in_and_the_gate_does_not_depend_on_it(monkeypatch):
+    """Remediation B ships OFF; the gate still detects and records without it.
+
+    ``_mirror_z_jog``'s own board-06 measurement (one legal site, and taking it
+    landed that pair on the 0.100-vs-0.1016 mm intra-pair rung) says it needs a
+    site-selection policy first, so the default path never calls it.
+    """
+    import kicad_tools.router.diffpair_routing as dpr_mod
+
+    assert dpr_mod._SHADOW_VIA_MIRROR is False
+
+    called: list[int] = []
+    monkeypatch.setattr(
+        dpr_mod.DiffPairRouter,
+        "_match_pair_via_signature",
+        lambda self, *a, **k: called.append(1) or True,
+        raising=True,
+    )
+    dpr, result = _run_shadow_with_tails(monkeypatch, _stub_tail_route_diving)
+
+    assert called == [], "the mirror must not run with KCT_SHADOW_VIA_MIRROR unset"
+    assert result is not None
+    assert dpr._last_shadow_decline_reason == "via-skew", "detection is independent of the mirror"
+
+
+def test_mirror_refuses_an_odd_via_excess():
+    """A z-jog adds vias in PAIRS; an odd difference is refused, not papered over."""
+    dpr = _diffpair_router()
+    deficient, partner = _mirror_legs(dpr)
+    partner.vias.pop()  # leaves a single unmatched via
+
+    assert dpr._match_pair_via_signature(deficient, partner, _AllClearPathfinder(), 2) is False
+
+
+def _spy_shadow_entry(monkeypatch, shadow_enabled: bool) -> list[str]:
+    """Drive the coupled pre-phase once and record whether #4570 code ran."""
+    from kicad_tools.router.diffpair_routing import DiffPairRouter
+
+    router, pair = _two_pad_coupled_router_and_pair()
+    dpr = router._diffpair
+    assert dpr.enable_shadow_construction is False, "the default must stay OFF"
+    dpr.enable_shadow_construction = shadow_enabled
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        DiffPairRouter,
+        "_shadow_route_pair",
+        lambda self, *a, **k: calls.append("shadow") or None,
+        raising=True,
+    )
+    monkeypatch.setattr(
+        DiffPairRouter,
+        "_layer_locked_router",
+        lambda self, layer_idx: calls.append("lock"),
+        raising=True,
+    )
+    dpr.route_differential_pair_coupled(pair, per_pair_timeout=2.0, coupled_only=True)
+    return calls
+
+
+def test_via_symmetry_path_is_unreachable_with_shadow_construction_off(monkeypatch):
+    """Shadow-OFF inertness, asserted structurally (#4536: no byte-identity).
+
+    Every #4570 behaviour hangs off ONE gated entry point -- the
+    ``enable_shadow_construction`` guard in front of ``_shadow_route_pair``.
+    With the flag off that method is never called, so neither the symmetry
+    gate nor the planar-tail preference can run.
+    """
+    assert _spy_shadow_entry(monkeypatch, shadow_enabled=False) == [], (
+        "shadow-OFF must reach neither the gate nor the layer lock"
+    )
+
+
+def test_shadow_entry_point_spy_is_not_vacuous(monkeypatch):
+    """Positive control for the inertness test above.
+
+    Without this, a fixture that never reached the shadow branch at all would
+    make the shadow-OFF assertion pass for the wrong reason.
+    """
+    assert _spy_shadow_entry(monkeypatch, shadow_enabled=True).count("shadow") >= 1
