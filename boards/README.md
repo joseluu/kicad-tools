@@ -30,10 +30,12 @@ kct build boards/01-voltage-divider --mfr jlcpcb
 
 | # | Board | Status | Components | Nets | Notes |
 |---|-------|--------|------------|------|-------|
+| 00 | [Simple LED](00-simple-led/) | ✅ Working | 3 | 3 | "Hello World" board; end-to-end pipeline gated in CI (`check_board_00_e2e.py`) |
 | 01 | [Voltage Divider](01-voltage-divider/) | ✅ Working | 4 | 3 | Simplest possible design, workflow validation |
 | 02 | [Charlieplex LED](02-charlieplex-led/) | ✅ Working | 14 | 8 | Routes 8/8 signal nets; both DRC engines clean (verified 2026-07-05) |
 | 03 | [USB Joystick](03-usb-joystick/) | ✅ Working | ~20 | 13 | Routes 13/13 on 2-layer in ~24s, 0 native DRC; recipe requests `--differential-pairs` (runtime coupling gated on [#3952]) |
 | 04 | [STM32 Dev Board](04-stm32-devboard/) | ✅ Working | ~30 | 12 | Fully routed via `generate_design.py`; kicad-cli DRC clean (verified 2026-07-05) |
+| 05 | [BLDC Motor Controller](05-bldc-motor-controller/) | 🚧 In progress | 55 | 52 | Three-phase HV/high-current bench (STM32G431 + DRV8301); phase nets routed, 3 ISENSE nets open pending level-2 escalation ([#3766]); CI-gated (`check_board_05_blocking.py`) |
 | 06 | [Diff-Pair Test](06-diffpair-test/) | ⚠️ Scaffold | 7 | 26 | Epic [#2556] Phase 4L regression bench --- USB 2.0/3.0, PCIe, MIPI on 4-layer; exercises Phase 1-3 features (intra_pair_clearance, coupled_routing, coupled_continuity_threshold, target_diff_impedance, skew_tolerance_mm) |
 | 07 | [Match-Group Test](07-matchgroup-test/) | ⚠️ Scaffold | 8 | 33 | Epic [#2661] Phase 3L regression bench --- DDR data byte, MIPI CSI, HDMI TMDS, address bus on 4-layer; exercises Phase 1A-2G match-group features (length_match_group, length_match_reference, length_match_tolerance_mm) |
 
@@ -225,6 +227,7 @@ These are known limitations that may affect your experience:
 [#3918]: https://github.com/rjwalters/kicad-tools/issues/3918
 [#3921]: https://github.com/rjwalters/kicad-tools/issues/3921
 [#3922]: https://github.com/rjwalters/kicad-tools/issues/3922
+[#3766]: https://github.com/rjwalters/kicad-tools/issues/3766
 [#3952]: https://github.com/rjwalters/kicad-tools/issues/3952
 
 ## Project Files (.kct)
@@ -256,6 +259,15 @@ intent:
 ```
 
 ## Board Details
+
+### 00 - Simple LED (Hello World)
+
+The minimal 3-component "Hello World" of electronics:
+- Power connector, current-limit resistor, LED
+- Exercises the full project → schematic → PCB → route → verify pipeline
+- End-to-end result is pinned in CI (`scripts/ci/check_board_00_e2e.py`)
+
+**Demonstrates**: The complete kicad-tools workflow at the smallest possible scale
 
 ### 01 - Voltage Divider (Simplest)
 
@@ -294,6 +306,18 @@ STM32F103 "Blue Pill" style development board:
 - User LED
 
 **Demonstrates**: Programmatic schematic generation with circuit blocks
+
+### 05 - BLDC Motor Controller (High-Current / HV Bench)
+
+Three-phase brushless DC motor controller (STM32G431K8 MCU + DRV8301
+gate driver, QFN-56):
+- 2.0mm high-current motor-phase trees (PHASE_A/B/C routed)
+- Kelvin current-sense (ISENSE) routing rules; 3 ISENSE nets still open
+  pending level-2 escalation ([#3766])
+- Thermal analysis, zone generation, and HV/creepage work happen here
+- Blocking status pinned in CI (`scripts/ci/check_board_05_blocking.py`)
+
+**Demonstrates**: High-current routing, thermal/zone generation, HV-isolation loop
 
 ### 06 - Differential Pair Test (Routing Testbench)
 

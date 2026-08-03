@@ -19,6 +19,7 @@ For complete board designs, see the [boards/](../boards/) directory.
 | [09-manufacturing-export](09-manufacturing-export/) | End-to-end manufacturing output | Gerbers, BOM, PnP, JLCPCB, PCBWay |
 | [10-complete-kct-workflow](10-complete-kct-workflow/) | Complete .kct to manufacturing workflow | Project spec, schematic gen, PCB, routing, export |
 | [llm-routing](llm-routing/) | LLM-driven PCB layout decisions | Reasoning agent, command vocabulary, feedback loops |
+| [patterns](patterns/) | Reusable circuit-pattern placement rules (YAML) | LED indicator, RC low-pass, temperature sensor, feedback divider |
 | [agent-integration](agent-integration/) | AI agent tool definitions and examples | Claude tools, OpenAI functions, error handling |
 
 ## Quick Start

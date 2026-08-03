@@ -61,7 +61,6 @@ kicad_tools/
 ├── export/        # Manufacturing export
 ├── reasoning/     # LLM-driven PCB layout
 ├── mcp/           # MCP server for AI agent integration
-├── layout/        # Layout preservation for PCB regeneration
 └── cli/           # Command-line interface
 ```
 

@@ -630,7 +630,7 @@ All commands support `--format json` for machine-readable output.
 | `progress` | Progress callbacks for long-running operations |
 | `datasheet` | Datasheet search, download, and PDF parsing |
 | `mcp` | MCP server for AI agent integration |
-| `layout` | Layout preservation for PCB regeneration |
+| `pcb.layout` | Layout preservation for PCB regeneration |
 
 ## What's New (v0.19.0, July 2026)
 
@@ -804,7 +804,7 @@ uv run ruff format . --check && uv run ruff check . && uv run pytest
 
 ## Agent Skills (`kct` namespace)
 
-kicad-tools ships its own Claude agent skills under `.claude/commands/kct/` (invoked as `/kct:<name>`), a harness-agnostic namespace kept separate from any installed orchestration framework. Five skills ship today — `/kct:tapeout` (complete fab-ready export bundle or loud refusal), `/kct:manufacturing-readiness` (sign-off gates), `/kct:board-recipe-scaffold`, `/kct:layout-journal`, and `/kct:ee-review` (advisory EE decision document for analog/placement-blocked boards). See [.claude/commands/kct/README.md](.claude/commands/kct/README.md) for the full contracts.
+kicad-tools ships its own Claude agent skills under `.claude/commands/kct/` (invoked as `/kct:<name>`), a harness-agnostic namespace kept separate from any installed orchestration framework. Seven skills ship today — `/kct:tapeout` (complete fab-ready export bundle or loud refusal), `/kct:manufacturing-readiness` (sign-off gates), `/kct:hv-isolation-loop` (mains/HV creepage design loop), `/kct:board-recipe-scaffold`, `/kct:layout-journal`, `/kct:ee-review` (advisory EE decision document for analog/placement-blocked boards), and `/kct:help` (introspective guide to the namespace). See [.claude/commands/kct/README.md](.claude/commands/kct/README.md) for the full contracts.
 
 ## Related Projects
 

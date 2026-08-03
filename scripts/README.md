@@ -30,7 +30,8 @@ end-to-end checks, the mypy baseline, and route determinism:
 `board06_determinism_smoke.sh`, `board_route_determinism_smoke.sh`,
 `check_board_00_e2e.py`, `check_board_05_blocking.py`, `check_copper_lvs.py`,
 `check_diffpair_coverage.py`, `check_matchgroup_coverage.py`,
-`check_mypy_baseline.py`, `check_routed_drc.py`, `net_class_map_resolver.py`.
+`check_mypy_baseline.py`, `check_net_status.py`, `check_routed_drc.py`,
+`net_class_map_resolver.py`.
 
 ### `research/`
 
