@@ -43,13 +43,14 @@ git checkout -- <out-of-scope-file>
 
 **No Loom runtime markers staged.** `worktree.sh` drops a `.loom-managed` sentinel
 into every issue worktree, and other flows may leave `.loom-in-use` /
-`.loom-checkpoint`. These are gitignored by a correctly-installed repo, but a stale
-or pre-#3838 `.gitignore` may not cover them — so a blanket `git add -A` can sweep
-them into your commit. Before committing, confirm none are staged:
+`.loom-checkpoint` / the `.no-changes-needed` no-changes signal (see "Signaling
+No Changes Needed" below). These are gitignored by a correctly-installed repo, but
+a stale or pre-#3838 `.gitignore` may not cover them — so a blanket `git add -A`
+can sweep them into your commit. Before committing, confirm none are staged:
 
 ```bash
 git -C "$WORKTREE_ABS" diff --cached --name-only \
-  | grep -E '(^|/)\.loom-managed$|(^|/)\.loom-in-use$|(^|/)\.loom-checkpoint$' \
+  | grep -E '(^|/)\.loom-managed$|(^|/)\.loom-in-use$|(^|/)\.loom-checkpoint$|(^|/)\.no-changes-needed$' \
   && echo "ERROR: unstage the Loom runtime marker above (git rm --cached <file>)" \
   || echo "OK: no Loom runtime markers staged"
 ```
@@ -343,6 +344,17 @@ git -C "<WORKTREE_ABS>" status        # your changes should appear HERE
 ./.loom/scripts/check-main-clean.sh   # exits 3 if you contaminated main (#3513)
 ```
 
+**If it exits 3, clean up ALL-OR-NOTHING — never file by file (#4380).** Do not
+walk the offending paths with `git checkout -- <path>` / `rm <path>`; a
+half-restored main checkout is worse than either extreme. Re-run the check with
+`--quarantine` to move every offending path (tracked *and* untracked) into a
+stash rescue ref in one operation, then replay that diff inside your worktree:
+
+```bash
+./.loom/scripts/check-main-clean.sh --quarantine --label "issue=<N>"   # exit 4 ⇒ quarantined
+git -C "<MAIN_ROOT>" stash show -p stash@{0}                           # nothing was discarded
+```
+
 **If your working directory does NOT contain `.loom/worktrees/issue-`:**
 1. **STOP** - do not write any code
 2. Create the worktree: `./.loom/scripts/worktree.sh <issue-number>`
@@ -378,6 +390,27 @@ fix is always the same: re-run the assertions above and use `$WORKTREE_ABS`,
 never to fall back to the other tool for the same target path — that fallback
 is exactly how sweep #4063 escaped and edited live guard hooks in the main
 checkout.
+
+### NEVER run `resync-installed.sh` from your worktree (#4563)
+
+**Do not run `./.loom/scripts/resync-installed.sh` (or any variant of it) while
+working an issue.** It always resolves the installed `.loom/` against the
+**primary** worktree, so running it from `.loom/worktrees/issue-<N>` writes to the
+**main checkout** — not to your worktree. Nothing in your own `git status`
+changes, so the contamination is invisible to you until `check-main-clean.sh`
+quarantines it (that is exactly what happened on 2026-07-30: a wave-2 builder
+resynced from its worktree and wrote four installed paths into `main` mid-sweep).
+
+You never need it: **editing `defaults/` is the whole job.** Propagating those
+edits into the installed `.loom/hooks|scripts|roles|docs|bin/` +
+`.claude/commands/loom/` copies is the periodic `chore: resync installed Loom
+surfaces` commit's job, made from the main checkout **after** your PR merges. Do
+not "helpfully" refresh the installed copies in your PR.
+
+The script now refuses to run from a linked worktree (exit `1`, `--dry-run`
+included). If you see that refusal, the fix is to **stop**, not to re-run with
+`--allow-worktree` — that override exists for a human operator deliberately
+rewriting the main checkout's installed copies, not for a Builder mid-issue.
 
 ### Working with gh CLI from a Worktree
 

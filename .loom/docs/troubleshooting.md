@@ -66,6 +66,11 @@ loom-clean --deep --force  # Non-interactive deep clean
 loom-clean --deep --dry-run  # Preview deep clean
 ```
 
+`loom-clean` is a thin shim for `loom-daemon clean` and needs a `loom-daemon`
+binary built at or after commit `dba33666` (PR #4301) — see [fail on a stale
+binary](#loom-clean--loom-cleanup--loom-recover-orphans-fail-on-a-stale-binary-4384)
+if it errors out instead of running.
+
 **What loom-clean does**:
 - Removes worktrees for closed GitHub issues (prompts per worktree in interactive mode)
 - Deletes local feature branches for closed issues
@@ -113,6 +118,106 @@ git worktree remove .loom/worktrees/issue-42 --force
 git worktree prune
 ```
 
+### `loom-clean` / `loom-cleanup` / `loom-recover-orphans` fail on a stale binary (#4384)
+
+**Symptom**: one of the three commands below fails outright instead of doing
+anything — either with a `No module named loom_tools.clean` traceback (an
+old pip-installed console script), or with an explicit `ERROR clean.sh: … does
+not support the 'clean' subcommand (stale build)` from the wrapper.
+
+**Root cause**: all three are now thin front-ends for native `loom-daemon`
+subcommands (#4272 / PR #4301, commit `dba33666`):
+
+| Command / wrapper | Native subcommand |
+|---|---|
+| `loom-clean`, `./.loom/scripts/clean.sh` | `loom-daemon clean` |
+| `./.loom/scripts/cleanup.sh` | `loom-daemon cleanup logs` |
+| `loom-recover-orphans`, `./.loom/scripts/recover-orphaned-shepherds.sh` | `loom-daemon recover-orphans` |
+
+The same commit deleted the Python implementations (`loom_tools/clean.py`,
+`cleanup.py`, `orphan_recovery.py`) and their console-script entry points, so
+**there is no fallback**: a `loom-daemon` binary built before `dba33666` leaves
+no working path at all. The wrappers capability-probe the binary and now fail
+loudly with the remedy rather than degrading into a traceback.
+
+**Check whether your binary is the problem**:
+
+```bash
+loom-daemon --version          # note the commit
+loom-daemon clean --help       # "error: unrecognized subcommand 'clean'" => stale
+```
+
+**Remedy — rebuild or update `loom-daemon`, then retry**:
+
+```bash
+cargo build --release -p loom-daemon        # source checkout
+./.loom/scripts/cli/loom-daemon-update.sh   # installed host (self-update)
+```
+
+Use `loom-daemon clean --force` / `loom-daemon recover-orphans --recover`
+directly in the meantime — the native subcommands take the same flags.
+
+**If a stale pip-era shim is shadowing the current one**: the installer writes
+`loom-clean` / `loom-recover-orphans` shims next to the provisioned
+`loom-daemon` (usually `~/.local/bin`). A pre-#4301 pip/homebrew install can
+leave `from loom_tools.clean import main` shims earlier on `PATH` that will
+never work again. Confirm with `command -v loom-clean` and remove them (e.g.
+`pip uninstall loom-tools`, or delete the stale shim) so the daemon-backed one
+resolves.
+
+### Corrupted local git identity (`...github.comecho`, "cannot overwrite multiple values") (#4369)
+
+**Symptom**: `git config user.email <value>` fails with `error: cannot
+overwrite multiple values`, or a commit/merge ships with a garbled author
+email like `loom-reviewer@users.noreply.github.comecho`.
+
+**Root cause**: a now-deleted Tauri-era code path once pushed two shell lines
+into an agent's terminal to set a per-role git identity — `git config
+user.email "<email>"` immediately followed by an `echo "✓ Git identity
+configured..."` line. A lost newline between the two glued the `echo`
+token onto the email, corrupting it, and because `git config user.email
+<v>` *replaces* rather than appends, repeated writes/`--add` improvisation
+could also stack multiple values for the same key. That code was removed in
+`d61acab0` (#3353) — **nothing on `main` writes `user.email`/`user.name`
+anymore** — but the corrupted/stacked values persist as residue in any
+checkout that predates the removal, and worktrees inherit them from the
+parent repo's shared `.git/config`.
+
+**Detect it**:
+
+```bash
+./.loom/scripts/check-git-identity.sh
+```
+
+This reads LOCAL (repo + per-worktree) scope only — never your global
+identity — so a normal setup with no repo-local override never
+false-positives. It exits `0` when clean, `1` (warning) when it finds
+plain stacked values with no corruption, and `3` (hard fail) when it finds
+the glued-token corruption pattern. `./.loom/scripts/worktree.sh` runs this
+check automatically at worktree creation: it hard-fails on the corruption
+pattern (a garbled commit author would otherwise ship silently — see PR
+#4303) and warns-but-proceeds on a plain multi-value.
+
+**Fix it** — preferred, falls back to your global identity (Loom no longer
+sets a per-role local identity, so the local values are pure residue):
+
+```bash
+git config --unset-all user.email && git config --unset-all user.name
+```
+
+**Alternative** — keep one specific value (e.g. no global identity is
+configured on this host):
+
+```bash
+git config --replace-all user.email <value-to-keep>
+git config --replace-all user.name  <value-to-keep>
+```
+
+After either fix, re-run `./.loom/scripts/check-git-identity.sh` to confirm
+it now reports clean, and verify a new commit picks up the intended author
+with `git commit --allow-empty -m test && git log -1 --format='%an <%ae>'`
+(then drop the test commit).
+
 ### Labels out of sync
 
 ```bash
@@ -129,7 +234,7 @@ Run the sync script — or create the one label directly — to reconcile:
 ```bash
 gh label list --search operator                      # empty => not provisioned
 gh label create "loom:operator-only" --color F97316 \
-  --description "Requires human action outside automation (credentials, infra, hardware); sweep/shepherd skip"
+  --description "Requires human action or ruling outside automation (creds, infra, hardware); sweep skips"
 ```
 
 **GitHub caps label descriptions at 100 characters.** A `labels.yml` entry with a
@@ -143,14 +248,54 @@ These two status labels look similar but mean different things to the automation
 - **`loom:blocked`** — work is *automatable* but currently waiting on a dependency
   (another issue, an unmerged PR, missing context). The intent is "unblock it, then
   a Builder can proceed."
-- **`loom:operator-only`** — work requires a *human to act outside automation
-  entirely* (rotating credentials, infra changes, hardware access, manual deploys).
-  Sweep/shepherd skip these in pre-flight rather than attempting them; a human must
+- **`loom:operator-only`** — work requires a *human to act or rule outside
+  automation entirely* (rotating credentials, infra changes, hardware access,
+  manual deploys — or an owner-gated decision: an issue the code owner filed as a
+  TODO on owner-tracked code, where the design direction is the owner's call).
+  Sweep skips these in pre-flight rather than attempting them; a human must
   do the work off-automation before the issue can proceed.
 
 Reaching for `loom:blocked` when you mean `loom:operator-only` conflates "waiting on
 a dependency" with "needs a human action," which muddies the daemon/sweep skip
 semantics. Use `loom:operator-only` for the human-must-act-off-automation case.
+
+### An operator edit to `.loom/config.json` disappeared (#4641)
+
+`.loom/config.json` has exactly one production writer: `loom-daemon init` (run by
+`install.sh` reinstalls and by the `fleet add-worker` provisioning steps).
+`resync-installed.sh` and `loom-daemon calibrate --write` never touch it.
+
+`init`'s merge is **existing-wins** — consumer keys, including ones absent from the
+shipped template such as `autonomous.workFinder.maxConcurrent`, survive — so a
+tuned value vanishing means one of the other branches fired. Every `init` call now
+emits one greppable line naming the branch it took:
+
+```bash
+grep 'init: config.json:' ~/.loom/daemon.log
+```
+
+| Branch | Level | Meaning |
+|--------|-------|---------|
+| `fresh-write` | `info` | No config existed; the template was written verbatim. |
+| `merge-preserved` | `info` | Existing values kept. Carries a per-key diff (`+ added`, `~ changed`, `- dropped`) or "no effective config change". |
+| `template-invalid-skip` | `warn` | The shipped `defaults/config.json` is unparseable; your file was left untouched (and got no template updates). |
+| `invalid-JSON-fallback-overwrite` | `warn` | **Your config was replaced by the template.** The line names the discarded keys. |
+
+A `~` or `-` entry on `merge-preserved` is unexpected under existing-wins semantics
+and is worth investigating.
+
+The fallback branch only fires when the file on disk does not parse as a JSON
+object (a torn write from a concurrent writer, a hand-edit with a syntax error, or
+a top-level array). Before overwriting, `init` copies the unparseable bytes to
+`.loom/config.json.bak` — recover your tuned keys from there:
+
+```bash
+cat .loom/config.json.bak
+```
+
+`.loom/*.bak` is git-ignored, and `fleet add-worker` no longer re-runs
+`loom-daemon init` against a workspace that already has a `.loom/config.json`, so
+repeat provisioning passes cannot re-enter this path on a tuned host.
 
 ### Daemon won't start
 
@@ -229,6 +374,11 @@ loom-recover-orphans --recover
 # JSON output for automation
 loom-recover-orphans --json
 ```
+
+`loom-recover-orphans` is a thin shim for `loom-daemon recover-orphans` — if it
+fails with `No module named loom_tools.orphan_recovery` or a "stale build"
+error, see [`loom-clean` / `loom-cleanup` / `loom-recover-orphans` fail on a
+stale binary](#loom-clean--loom-cleanup--loom-recover-orphans-fail-on-a-stale-binary-4384).
 
 **What it does**:
 - Finds issues with `loom:building` label that have been stuck
@@ -475,6 +625,13 @@ claude -p "/loom:hermit"    --dangerously-skip-permissions
 
 ## Overnight / long-running orchestration
 
+> **Supervising a long window: `/loom:watch` (#4762).** The tick loop that probes
+> fleet health, applies a closed set of remediations, and prints an end-of-window
+> summary is a skill: `/loom:watch [--until 07:00] [--interval 25m]`
+> (`--dry-run` for a single read-only tick). It assumes — and does not restate —
+> the host-sleep and `.loom/` resync procedures in this section. See
+> `.claude/commands/loom/watch.md`.
+
 ### Keeping the host awake (#3350)
 
 `/loom:sweep` automatically runs `./.loom/scripts/check-host-sleep.sh` at startup
@@ -532,7 +689,13 @@ This is a **detect → fix** pair:
   those are reported `skipped`, never overwritten). Loom-internal files declared in
   `defaults/.loom-internal.list` are skipped (never resurrected into a consumer).
   On a successful non-dry-run it also re-stamps `loom_version`, `loom_commit`, and
-  a new `last_resync` date into `.loom/install-metadata.json`. One guard exception
+  a new `last_resync` date into `.loom/install-metadata.json`. Since that file is a
+  machine-local stamp every host's resync rewrites, resync also ensures (every
+  run, self-healing existing installs) a `merge=ours` attribute for it in a
+  Loom-managed `.gitattributes` block plus the required local (never committed)
+  `git config merge.ours.driver true` — so two hosts that each committed a resync
+  no longer conflict on `git merge`/`git pull`; the file is fully re-derived by the
+  next resync regardless of which side "wins" (#4528). One guard exception
   (#4041): the vendored generic guard `hooks/guard-destructive-generic.sh` is
   **not** resynced (and any stale copy is removed) in a repo where the canonical
   Repo Skills guard (`.claude/skills/repo/hooks/guard-destructive.sh`, carrying the
@@ -547,9 +710,42 @@ This is a **detect → fix** pair:
 `scripts/setup-mcp.sh`), and the metadata `install_date` + `installed_files`
 fields (installer-owned).
 
+**Run it from the main checkout only (#4563).** The installed `.loom/` is always
+resolved against the **primary** worktree (via `git rev-parse --git-common-dir`),
+so a resync launched from a linked worktree — an issue/PR worktree under
+`.loom/worktrees/` — writes to the **main checkout**, not to the worktree you are
+standing in. That is exactly how a wave-2 Builder contaminated `main` mid-sweep on
+2026-07-30 (four installed paths written into `main` and quarantined by
+`check-main-clean.sh`). The script therefore **refuses to run** (exit `1`,
+including under `--dry-run`) when its own `git rev-parse --show-toplevel` differs
+from the resolved main-checkout root. Landing a `defaults/` change does **not**
+require you to resync: installed-copy propagation is the periodic
+`chore: resync installed Loom surfaces` commit's job, made from the main checkout
+after the change merges. An operator who really does mean "rewrite the main
+checkout's installed copies from this worktree" can pass `--allow-worktree` (or
+export `LOOM_RESYNC_ALLOW_WORKTREE=1`); it then proceeds with a warning naming the
+main-checkout target. Running from the main checkout — including any subdirectory
+of it — is unaffected.
+
+**It can safely update itself (#4669).** `resync-installed.sh` is one of the files
+under `defaults/scripts/`, so every run copies a newer version over the very path
+the running Bash process is still reading from. It used to do that with an
+in-place `cp`, which truncates and rewrites the destination: Bash then resumed
+reading its own (now shorter) script at a stale byte offset and either died with
+`syntax error near unexpected token` or fell off the end mid-run — leaving dozens
+of surfaces refreshed, the rest stale, and no summary saying so. Now every file
+is staged beside its destination and `rename(2)`-d into place (atomic; the
+already-open inode is left intact), and the self-copy is additionally **deferred
+until every other surface has settled**. If a file cannot be staged or renamed
+(read-only mount, permissions, no disk space) the run still finishes the
+remaining files and then prints an explicit **`PARTIAL REFRESH`** block naming
+every failed path and **exits `1`** — nothing is ever half-written, so fixing the
+cause and re-running completes the refresh.
+
 The intended flow is **"freshness warning says you're stale → run resync"**:
 
 ```bash
+cd <main checkout>                              # NOT .loom/worktrees/issue-N (#4563)
 git merge --ff-only origin/main                 # bring defaults/ current
 ./.loom/scripts/resync-installed.sh --dry-run   # preview what would change (exits 2 on drift)
 ./.loom/scripts/resync-installed.sh             # apply

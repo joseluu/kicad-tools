@@ -44,6 +44,22 @@
 #     stopped (this script never widens FLAGS-OFF by starting autonomy that
 #     wasn't already running).
 #
+# Stale-entry-point advisory (#4079 hardening, epic #4081 Phase 4 / #4557):
+# on every path — including --check, --dry-run, and an up-to-date no-op — this
+# script scans PATH for `loom-*` executables that do NOT resolve to the
+# loom-daemon binary it just resolved, and WARNS about each one. This is the
+# #4079 failure mode: a long-gone `pip install -e loom-tools` left frozen
+# console scripts in ~/.local/bin that kept shadowing the Rust binary's own
+# entry points, so agents ran ancient logic while `--version` looked fresh.
+# Since #4557 deleted that Python package, nothing regenerates such scripts
+# ever again. The warning ALSO fires when PATH holds more than one
+# `loom-daemon` (the first shadows the rest). It is advisory only: nothing is
+# deleted, PATH is untouched, and the exit code is unaffected. The
+# auto-generated `loom-clean`/`loom-recover-orphans`/`loom-claim` shims
+# (#4272/#4275) pointing at the resolved binary, and the surviving `loom-search`
+# console script (#4557's carve-out), are never flagged. Suppress with
+# LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1.
+#
 # Launchd-managed daemons (#4042): on Darwin the daemon is commonly launchd-
 # managed (default since #3972/#4054), in which case NEITHER .loom/.daemon.pid
 # nor .loom/.daemon.flags reliably reflects "is it running" — the pid file goes
@@ -111,6 +127,14 @@
 #                          exact path instead of the machine-level default.
 #   LOOM_DAEMON_BIN_DIR   Machine-level install dir (default ~/.local/bin),
 #                          forwarded to provision-daemon.sh.
+#   LOOM_SKIP_STALE_ENTRY_POINT_CHECK  1/true/yes suppresses the advisory
+#                          stale-`loom-*`-entry-point warning described below.
+#   LOOM_SKIP_IDLE_SHUTDOWN_NOTICE  1/true/yes suppresses the advisory
+#                          post-update idle-shutdown cron-guard notice (#4697):
+#                          "this host will power itself off after N idle
+#                          minutes" when a `fleet add-worker
+#                          --idle-shutdown-minutes` guard is installed. Silent
+#                          (no notice at all) when no such guard exists.
 #   LOOM_DAEMON_LAUNCHD    macOS only: 0/false/no disables ALL launchd interaction
 #                          (ownership detection + launchd restart), symmetric with
 #                          loom-daemon-start.sh / loom-daemon-stop.sh. A daemon
@@ -216,6 +240,19 @@ show_help() {
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# harvest_plist_env / harvest_unit_env (used by perform_relaunch /
+# perform_systemd_relaunch below) live in lib/daemon-env-harvest.sh (#4581) so
+# scripts/loom's loom_cmd_restart() bare-exec fallback can apply the identical
+# harvest-and-preserve pattern from a single source instead of a second copy.
+_LOOM_ENV_HARVEST_LIB="$SCRIPT_DIR/../lib/daemon-env-harvest.sh"
+if [[ -r "$_LOOM_ENV_HARVEST_LIB" ]]; then
+    # shellcheck source=/dev/null
+    source "$_LOOM_ENV_HARVEST_LIB"
+else
+    err "daemon-env-harvest.sh not found at $_LOOM_ENV_HARVEST_LIB — this checkout is missing an expected lib file."
+    exit 1
+fi
+
 # ---------- repo root ----------
 find_repo_root() {
     local dir="$PWD"
@@ -256,6 +293,189 @@ locate_daemon_bin() {
 # "loom-daemon 0.15.0 (commit ab12cd3, built 2026-07-26T12:00:00Z)" -> ab12cd3
 extract_commit() {
     echo "$1" | grep -oE 'commit [0-9a-f]+' | head -n1 | awk '{print $2}'
+}
+
+# ---------- stale `loom-*` entry-point check (#4079 hardening, #4557) ---------
+#
+# THE INCIDENT THIS EXISTS FOR (#4079, the direct motivation for epic #4081):
+# a `pip install -e loom-tools` from months earlier had left FROZEN console
+# scripts in ~/.local/bin. Those scripts outlived the Python package: they kept
+# shadowing the Rust `loom-daemon` binary's own PATH entry points, so operators
+# and agents silently ran ancient logic while `loom-daemon --version` reported a
+# fresh build. Epic #4081 Phase 4 (#4557) deleted the Python package outright,
+# which makes every surviving `loom-*` pip console script pure hazard: nothing
+# regenerates or updates them ever again.
+#
+# This check is a WARNING ONLY. It never deletes anything, never mutates PATH,
+# and never changes this script's exit code — an operator's ~/.local/bin is
+# theirs, and a false positive must not block an update. Opt out entirely with
+# LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1.
+#
+# A `loom-*` PATH entry is considered LEGITIMATE when it is either:
+#   1. `loom-daemon` itself (the native binary), or
+#   2. one of the auto-generated PATH shims provision-daemon.sh installs
+#      (`loom-clean`, `loom-recover-orphans`, `loom-claim` — #4272/#4275), whose
+#      sibling `loom-daemon` resolves to the SAME binary this script resolved, or
+#   3. `loom-search`, the one surviving Python console script (#4557's carve-out;
+#      see defaults/docs/semantic-search.md). It is not a daemon entry point and
+#      is never expected to resolve to the daemon binary.
+# Anything else is reported.
+
+#: `loom-*` names that are not daemon entry points and must not be flagged.
+STALE_ENTRY_POINT_ALLOWLIST="loom-search"
+
+# Portable realpath (macOS ships no GNU `realpath`/`readlink -f`).
+_lde_realpath() {
+    local target="$1" dir base
+    [[ -e "$target" ]] || { echo ""; return 0; }
+    # Resolve a chain of symlinks by hand, bounded to avoid a link loop.
+    local depth=0
+    while [[ -L "$target" && $depth -lt 32 ]]; do
+        local link
+        link="$(readlink "$target")"
+        case "$link" in
+            /*) target="$link" ;;
+            *)  target="$(dirname "$target")/$link" ;;
+        esac
+        depth=$((depth + 1))
+    done
+    dir="$(dirname "$target")"; base="$(basename "$target")"
+    if cd "$dir" 2>/dev/null; then
+        echo "$(pwd -P)/$base"
+        cd - >/dev/null 2>&1 || true
+    else
+        echo "$target"
+    fi
+}
+
+# _lde_shim_target <path> — for an auto-generated PATH shim, echo the
+# `loom-daemon` binary it execs (its sibling). Echoes "" for anything that is
+# not such a shim (a compiled binary, a Python console script, an operator's own
+# wrapper).
+_lde_shim_target() {
+    local path="$1"
+    # Binaries are not shims. `grep -Iq .` is the portable "is this a text
+    # file?" test (-I treats binary as non-matching).
+    grep -Iq . "$path" 2>/dev/null || { echo ""; return 0; }
+    if grep -q 'exec .*/loom-daemon"\? ' "$path" 2>/dev/null \
+       || grep -q 'Auto-generated PATH shim' "$path" 2>/dev/null; then
+        echo "$(dirname "$path")/loom-daemon"
+        return 0
+    fi
+    echo ""
+}
+
+# _lde_describe <path> — one-phrase classification for the warning line.
+_lde_describe() {
+    local path="$1" first_line
+    first_line="$(head -n1 "$path" 2>/dev/null || true)"
+    case "$first_line" in
+        *python*) echo "Python console script (stale pip/pipx editable install)" ;;
+        '#!'*)    echo "script, not a loom-daemon shim" ;;
+        *)        echo "not a loom-daemon PATH shim" ;;
+    esac
+}
+
+# warn_stale_entry_points <resolved_daemon_bin>
+warn_stale_entry_points() {
+    local resolved="$1"
+    [[ "${LOOM_SKIP_STALE_ENTRY_POINT_CHECK:-0}" =~ ^(1|true|yes)$ ]] && return 0
+
+    local resolved_real=""
+    [[ -n "$resolved" ]] && resolved_real="$(_lde_realpath "$resolved")"
+
+    # Counters are tracked ALONGSIDE the arrays rather than derived from them
+    # with `${#arr[@]}`. Under `set -u` (line 217), bash < 4.4 — notably the
+    # bash 3.2 stock macOS still ships, and this script's launchd paths are
+    # macOS-first — treats an empty array as unset, so `${#stale_lines[@]}`
+    # would abort the whole update with "unbound variable" on the overwhelmingly
+    # common clean-PATH case. Every array read below is likewise guarded with
+    # the `${arr[@]+"${arr[@]}"}` idiom for the same reason.
+    local -a stale_lines=()
+    local -a daemon_hits=()
+    local -a seen_dirs=()
+    local stale_count=0
+    local daemon_count=0
+
+    local oldifs="$IFS"
+    IFS=':'
+    # shellcheck disable=SC2206 # deliberate word-splitting of $PATH on ':'
+    local -a path_dirs=($PATH)
+    IFS="$oldifs"
+
+    local dir
+    for dir in "${path_dirs[@]}"; do
+        [[ -z "$dir" ]] && dir="."
+        [[ -d "$dir" ]] || continue
+        # Dedupe repeated PATH entries so one file is never reported twice.
+        local dir_real seen skip
+        dir_real="$(_lde_realpath "$dir")"
+        skip=false
+        for seen in ${seen_dirs[@]+"${seen_dirs[@]}"}; do
+            [[ "$seen" == "$dir_real" ]] && { skip=true; break; }
+        done
+        [[ "$skip" == "true" ]] && continue
+        seen_dirs+=("$dir_real")
+
+        local entry
+        for entry in "$dir"/loom-*; do
+            [[ -f "$entry" && -x "$entry" ]] || continue
+            local name
+            name="$(basename "$entry")"
+
+            if [[ "$name" == "loom-daemon" ]]; then
+                daemon_hits+=("$entry")
+                daemon_count=$((daemon_count + 1))
+                continue
+            fi
+
+            # Allowlisted non-daemon entry points (the loom-search carve-out).
+            case " $STALE_ENTRY_POINT_ALLOWLIST " in
+                *" $name "*) continue ;;
+            esac
+
+            local shim_target shim_real
+            shim_target="$(_lde_shim_target "$entry")"
+            if [[ -n "$shim_target" && -x "$shim_target" ]]; then
+                shim_real="$(_lde_realpath "$shim_target")"
+                if [[ -n "$resolved_real" && "$shim_real" == "$resolved_real" ]]; then
+                    continue  # a current shim pointing at the resolved binary
+                fi
+                stale_lines+=("$entry — PATH shim execs $shim_target, which is NOT the resolved binary (${resolved:-<none>})")
+                stale_count=$((stale_count + 1))
+                continue
+            fi
+
+            stale_lines+=("$entry — $(_lde_describe "$entry")")
+            stale_count=$((stale_count + 1))
+        done
+    done
+
+    if (( stale_count > 0 )); then
+        warn "Stale 'loom-*' entry points found on PATH ($stale_count):"
+        local line
+        for line in ${stale_lines[@]+"${stale_lines[@]}"}; do
+            warn "  - $line"
+        done
+        warn "These do NOT resolve to the current loom-daemon binary. Loom's Python package"
+        warn "was retired (epic #4081 Phase 4, #4557), so nothing regenerates them — they are"
+        warn "frozen and will shadow the real binary's entry points (incident #4079)."
+        warn "Remove them, e.g.:  rm <path>    (or 'pipx uninstall loom-tools')"
+        warn "Suppress this check with LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1."
+    fi
+
+    # A second, distinct hazard: more than one `loom-daemon` on PATH. The first
+    # wins for every caller that resolves by name, so later ones are shadowed —
+    # exactly the ambiguity #4079 made costly.
+    if (( daemon_count > 1 )); then
+        warn "Multiple 'loom-daemon' binaries on PATH — the FIRST shadows the rest:"
+        local hit
+        for hit in ${daemon_hits[@]+"${daemon_hits[@]}"}; do
+            warn "  - $hit ($("$hit" --version 2>/dev/null | head -n1 || echo 'version unreadable'))"
+        done
+        warn "Callers resolving 'loom-daemon' by name get ${daemon_hits[0]}. Remove the others"
+        warn "or pin LOOM_DAEMON_BIN explicitly."
+    fi
 }
 
 # verify_destination_binary <dest_path> — assert the provisioned binary at
@@ -494,12 +714,60 @@ elif [[ "$INSTALLED_COMMIT" != "$SOURCE_COMMIT" ]]; then
     UPDATE_NEEDED=true
 fi
 
+# Advisory only, and deliberately placed here so it is reported on EVERY path —
+# --check, --dry-run, an up-to-date no-op, and a full rebuild alike. A stale
+# entry point is invisible precisely when the daemon looks healthy (#4079).
+warn_stale_entry_points "$DAEMON_BIN"
+
+# ---------- idle-shutdown cron-guard post-update notice (#4697) ----------
+#
+# THE INCIDENT THIS EXISTS FOR: a remote worker was updated via this script —
+# the rebuild + supervised restart succeeded onto the new binary — and ~15
+# minutes later the host powered itself off. Nothing in the update flow
+# warned that the "successful" update was landing on a host about to
+# evaporate: the STAGE-2 cron guard `fleet add-worker --idle-shutdown-minutes`
+# installs (`render_idle_shutdown()` in loom-daemon/src/fleet/add_worker.rs,
+# NOT `autonomous.idleExit` stage 1 — that daemon-level exit is self-defeating
+# under `Restart=on-success` systemd/launchd supervision, since the supervisor
+# immediately relaunches it) fired once the freshly-relaunched, idle daemon
+# crossed the configured window, and powered the WHOLE HOST off — SSH,
+# tailnet, everything.
+#
+# This is purely advisory: it never disables/touches the guard, never changes
+# this script's exit code, and is silent when no guard is installed
+# (LOOM_SKIP_IDLE_SHUTDOWN_NOTICE=1 also suppresses it for scripted/quiet
+# use). The idle-shutdown guard's own design (#3998/#4477) is correct and out
+# of scope here — the gap this closes is purely operator awareness at the
+# moment a "successful" update is reported.
+IDLE_SHUTDOWN_GUARD_SCRIPT="$HOME/.local/bin/loom-idle-shutdown.sh"
+
+idle_shutdown_notice() {
+    [[ "${LOOM_SKIP_IDLE_SHUTDOWN_NOTICE:-0}" =~ ^(1|true|yes)$ ]] && return 0
+    command -v crontab >/dev/null 2>&1 || return 0
+    crontab -l 2>/dev/null | grep -q 'loom-idle-shutdown' || return 0
+
+    local minutes=""
+    if [[ -r "$IDLE_SHUTDOWN_GUARD_SCRIPT" ]]; then
+        minutes="$(grep -oE 'LIMIT=[0-9]+' "$IDLE_SHUTDOWN_GUARD_SCRIPT" 2>/dev/null \
+            | head -n1 | cut -d= -f2)"
+    fi
+
+    if [[ -n "$minutes" ]]; then
+        warn "Heads up: this host has an idle-shutdown cron guard installed (fleet add-worker --idle-shutdown-minutes ${minutes}) — after ~${minutes} idle minute(s) it POWERS THE WHOLE HOST OFF (SSH/tailnet included), not just this daemon. This is expected/by-design (#3998/#4477), not a fault in this update. Wake path (provider console/CLI restart; Loom never calls a cloud CLI itself) and tailnet-identity/re-registration notes: daemon-reference.md, 'fleet add-worker' step 9 (idle-shutdown)."
+    else
+        warn "Heads up: this host has an idle-shutdown cron guard installed (crontab holds a loom-idle-shutdown entry, but the configured window could not be read from $IDLE_SHUTDOWN_GUARD_SCRIPT) — it WILL power the whole host off after some idle window. This is expected/by-design (#3998/#4477), not a fault in this update. See daemon-reference.md, 'fleet add-worker' step 9 (idle-shutdown), for the wake path."
+    fi
+}
+
 # print_final_installed_line <commit> — the AC4 "final installed line": states
 # the built/installed commit AND whether it matches origin/<default-branch> at
 # build time. Uses ORIGIN_COMMIT resolved by sync_with_origin above (no
 # re-fetch). Prints an honest "unknown" comparison when the default branch or
 # origin commit could not be resolved (offline, no origin remote, etc.) rather
-# than silently omitting the currency claim.
+# than silently omitting the currency claim. Also where the #4697 idle-shutdown
+# notice fires — every successful/"already up to date" exit path funnels
+# through this one function, so the notice is reported consistently without
+# duplicating the call at each of this script's several exit points.
 print_final_installed_line() {
     local commit="$1"
     if [[ -z "$DEFAULT_BRANCH" || "$ORIGIN_COMMIT" == "unknown" ]]; then
@@ -509,6 +777,7 @@ print_final_installed_line() {
     else
         echo "Installed: ${commit} (origin/${DEFAULT_BRANCH} is at ${ORIGIN_COMMIT} — does NOT match; built from a checkout that was behind or diverged, e.g. --allow-stale)"
     fi
+    idle_shutdown_notice
 }
 
 # ---------- launchd ownership detection (macOS, mirrors loom-daemon-stop.sh #4042) ----------
@@ -656,45 +925,10 @@ log_launchd_diagnostics() {
 # hardcodes the two supervised keys), preserving the live plist's autonomy/auth
 # env, and to stop the old daemon gracefully so sweep children reparent.
 
-# harvest_plist_env <plist> — echo the live plist's EnvironmentVariables,
-# restricted to exactly the keys render_launchd_plist itself forwards (LOOM_*,
-# GH_TOKEN, GITEA_TOKEN, FORGE_TOKEN) and EXCLUDING:
-#   - PATH / HOME     (start.sh resolves PATH deterministically -- a pinned
-#                      canonical minimal PATH by default, or an explicit
-#                      LOOM_DAEMON_PATH / LOOM_DAEMON_PATH_EXTRA override,
-#                      #4172; round-tripping the plist's PATH here would
-#                      re-introduce the non-deterministic-render bug),
-#   - LOOM_DAEMON_SUPERVISOR (start.sh hardcodes it; re-exporting is pointless).
-# Emits one "<key>\t<base64(value)>" line per key so values containing spaces or
-# newlines survive. Fails loudly (return 2) when the plist is absent or
-# unparseable — it must NEVER silently return an empty set, which would let the
-# re-render narrow the autonomy flags to FLAGS-OFF defaults (the #4011 class).
-harvest_plist_env() {
-    local plist="$1"
-    if [[ ! -f "$plist" ]]; then
-        err "Cannot harvest launchd env: plist not found at $plist"
-        return 2
-    fi
-    if ! command -v plutil >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
-        err "Cannot harvest launchd env: plutil and jq are both required on the macOS launchd path."
-        return 2
-    fi
-    local json
-    json=$(plutil -convert json -o - "$plist" 2>/dev/null) || {
-        err "Cannot harvest launchd env: plist at $plist is not parseable by plutil."
-        return 2
-    }
-    printf '%s' "$json" | jq -r '
-        .EnvironmentVariables // {}
-        | to_entries[]
-        | select(.key | test("^(LOOM_[A-Za-z0-9_]*|GH_TOKEN|GITEA_TOKEN|FORGE_TOKEN)$"))
-        | select(.key != "LOOM_DAEMON_SUPERVISOR")
-        | .key + "\t" + (.value | @base64)
-    ' 2>/dev/null || {
-        err "Cannot harvest launchd env: failed to extract EnvironmentVariables from $plist."
-        return 2
-    }
-}
+# harvest_plist_env is defined in lib/daemon-env-harvest.sh (#4581, sourced
+# near the top of this script) — shared with scripts/loom's loom_cmd_restart()
+# bare-exec fallback so both call sites apply the identical harvest-and-
+# preserve pattern from one source instead of two drifting copies.
 
 # perform_relaunch <plist> <service> — re-render the LaunchAgent and relaunch it
 # under launchd supervision, preserving the live plist's autonomy/auth env.
@@ -747,37 +981,9 @@ perform_relaunch() {
     "$START_SCRIPT"
 }
 
-# harvest_unit_env <unit_path> — echo the live systemd unit's `Environment=`
-# lines, restricted to exactly the keys render_systemd_unit itself forwards
-# (LOOM_*, GH_TOKEN, GITEA_TOKEN, FORGE_TOKEN) and EXCLUDING:
-#   - PATH / HOME     (start.sh resolves PATH deterministically, mirroring the
-#                      launchd plist path — round-tripping the unit's PATH here
-#                      would re-introduce the non-deterministic-render bug),
-#   - LOOM_DAEMON_SUPERVISOR (start.sh hardcodes it; re-exporting is pointless).
-# Emits one "<key>\t<value>" line per key (a systemd `Environment=KEY=VALUE`
-# line is single-valued, unlike the plist's XML dict, so no base64 round-trip is
-# needed here). Fails loudly (return 2) when the unit file is absent — it must
-# NEVER silently return an empty set, which would let the re-render narrow the
-# autonomy flags to FLAGS-OFF defaults (the #4011 class).
-harvest_unit_env() {
-    local unit_path="$1"
-    if [[ ! -f "$unit_path" ]]; then
-        err "Cannot harvest systemd unit env: unit file not found at $unit_path"
-        return 2
-    fi
-    local line rest key value
-    while IFS= read -r line; do
-        [[ "$line" == Environment=* ]] || continue
-        rest="${line#Environment=}"
-        key="${rest%%=*}"
-        value="${rest#*=}"
-        case "$key" in
-            LOOM_DAEMON_SUPERVISOR) continue ;;
-            LOOM_*|GH_TOKEN|GITEA_TOKEN|FORGE_TOKEN) printf '%s\t%s\n' "$key" "$value" ;;
-            *) continue ;;
-        esac
-    done < "$unit_path"
-}
+# harvest_unit_env is defined in lib/daemon-env-harvest.sh (#4581, sourced
+# near the top of this script) — see the harvest_plist_env pointer comment
+# above perform_relaunch for why it moved.
 
 # perform_systemd_relaunch <unit_path> <unit> — re-render the systemd --user
 # unit and relaunch it under supervision, preserving the live unit's
@@ -935,8 +1141,24 @@ if [[ "$DRY_RUN" == "true" ]]; then
 fi
 
 # ---------- rebuild ----------
+# Non-interactive SSH sessions (the fleet remote-update path, #4695) don't
+# source a login shell's profile, so a rustup-installed cargo living at the
+# default `~/.cargo/bin` is invisible to `command -v cargo` even though it IS
+# installed. Fall back the same way loom-daemon-start.sh:233 already does for
+# launchd/systemd's non-login-shell PATH: prefer sourcing rustup's own
+# `~/.cargo/env` (the canonical PATH-setup snippet rustup writes), and fall
+# back to prepending `~/.cargo/bin` directly if that script isn't present but
+# the binary still is (e.g. a non-rustup or partially-cleaned install).
 if ! command -v cargo >/dev/null 2>&1; then
-    err "cargo not found on PATH — cannot rebuild loom-daemon."
+    if [[ -f "$HOME/.cargo/env" ]]; then
+        # shellcheck disable=SC1091
+        source "$HOME/.cargo/env"
+    elif [[ -x "$HOME/.cargo/bin/cargo" ]]; then
+        export PATH="$HOME/.cargo/bin:$PATH"
+    fi
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+    err "cargo not found on PATH (checked \$HOME/.cargo/bin too) — cannot rebuild loom-daemon. Install Rust via rustup: https://rustup.rs"
     exit 1
 fi
 

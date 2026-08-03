@@ -29,7 +29,6 @@ boards/*/*/output/renders/
 # Board metrics (generated at runtime by `kct board-metrics`, Epic #3674)
 boards/*/output/board.json
 boards/*/*/output/board.json
-.loom/sweep-checkpoint/
 
 # Local credentials (BYO API keys -- issue #4118). NEVER commit real keys.
 .env
@@ -94,5 +93,6 @@ boards/*/*/output/board.json
 .loom/CANARY
 .loom/*.log
 .loom/*.sock
+.loom/*.tmp
 .loom/logs/
 # <<< loom-managed <<<

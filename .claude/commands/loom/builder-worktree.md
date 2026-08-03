@@ -250,6 +250,12 @@ When working with parallel agents (multiple Builders running simultaneously), us
 - Label change is still needed (for visibility), but loom-claim prevents races
 - First Builder to claim wins; others move to next issue
 
+> `loom-claim` is a PATH shim over `loom-daemon claim` (issue #4275 ported the
+> implementation from Python to native Rust). The command name, positional
+> grammar and exit codes below are unchanged, and the shim needs no pip install
+> — it is provisioned next to the `loom-daemon` binary. The `command -v
+> loom-claim` degradation guard below still applies unchanged.
+
 ### Claiming Workflow
 
 **1. Check for stop signals before claiming new work:**
@@ -305,7 +311,7 @@ while true; do
   fi
 
   # Find available issues
-  ISSUES=$(gh issue list --label="loom:issue" --state=open --json number --jq '.[].number')
+  ISSUES=$(gh issue list --label="loom:issue" --state=open --limit 500 --json number --jq '.[].number')
 
   for ISSUE_NUMBER in $ISSUES; do
     # Try atomic claim

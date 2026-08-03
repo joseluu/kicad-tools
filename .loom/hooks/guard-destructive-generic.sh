@@ -1510,6 +1510,169 @@ for pattern in "${ALWAYS_BLOCK_PATTERNS[@]}"; do
 done
 
 # =============================================================================
+# `gh pr/issue comment --body @path` — literal-@ silent data loss (#4523)
+#
+# `gh pr comment`/`gh issue comment --body @path` does NOT expand `@path` to
+# the file's contents the way `-F body=@path` (gh api) or `gh pr edit
+# --body-file path` do — it posts the literal string `@path` as the comment.
+# A real incident (PR #4457) lost an entire Judge changes-requested review
+# this way. The shape is never intentional (see judge.md's/doctor.md's
+# `--body @path` anti-pattern warning), so this is an ungated hard deny, like
+# the GitHub destructive ops above.
+#
+# DELIBERATELY scans the RAW $COMMAND, NOT COMMAND_NO_LITERAL_TEXT. This rule
+# is narrowly anchored — it only inspects the character immediately after the
+# --body/-b flag's opening quote (if any) — so, unlike the broad dangerous-
+# substring scans above, it does not need strip_literal_text()'s quoted-value
+# redaction to avoid false-positiving on prose. Scanning the redacted copy
+# would in fact silently BREAK this rule: strip_literal_text() replaces a
+# quoted value's entire inner text (including a leading `@`) with `X`s, so
+# `gh pr comment 123 --body "@/tmp/x"` would come out of redaction as
+# `--body "XXXXXXXXX"` — no `@` left to match. The unquoted form
+# (`--body @/tmp/x`) is untouched by redaction either way, so a naive
+# implementation that only smoke-tests the unquoted shape can look correct
+# while silently missing the quoted shape actually seen in the field.
+#
+# The `@` must be followed by a path-shaped character (`/`, `.`, or `~`) —
+# every real incident/test case is an absolute or relative path
+# (`@/tmp/...`, `@./relative/path`, `@~/home/path`). A bare `@word` right
+# after the opening quote is an @mention addressed to a reviewer (e.g.
+# `--body "@reviewer Could you clarify..."`, the shape doctor.md's own
+# "Can't Understand Feedback" example uses) and must NOT be treated as the
+# `-F body=@path` anti-pattern (#4577).
+GH_COMMENT_BODY_AT_PATTERN="(^|[;&|[:space:]])gh[[:space:]]+(pr|issue)[[:space:]]+comment[^;&]*(-b|--body)[[:space:]]*=?[[:space:]]*[\"']?@[/.~]"
+if echo "$COMMAND" | grep -qiE "$GH_COMMENT_BODY_AT_PATTERN"; then
+    deny "BLOCKED: 'gh pr comment'/'gh issue comment --body @path' does NOT expand the file — it posts the literal string '@path' as the comment (lost the PR #4457 review this way). Use --body \"\$(cat <<'EOF' ... EOF)\", -F/--body-file <path>, or 'gh api ... -F body=@<path>' instead." "gh-comment-body-literal-at"
+fi
+
+# =============================================================================
+# `gh pr/issue edit --body @path` — same literal-@ silent data loss, different
+# subcommand (#4685). The #4523 rule above is hard-anchored to `comment`, so
+# `gh issue edit N --body @path` sailed through untouched and posted the
+# literal string as the issue/PR BODY (not a comment) — real-world evidence:
+# issue #4608's body was corrupted to the literal string
+# `@/tmp/issue4608_body_new.txt`. Deliberately a SEPARATE rule/regex, not a
+# widened GH_COMMENT_BODY_AT_PATTERN (#4577's additive-not-widened precedent),
+# so the two subcommands' patterns can be fixed/tuned independently.
+# =============================================================================
+GH_EDIT_BODY_AT_PATTERN="(^|[;&|[:space:]])gh[[:space:]]+(pr|issue)[[:space:]]+edit[^;&]*(-b|--body)[[:space:]]*=?[[:space:]]*[\"']?@[/.~]"
+if echo "$COMMAND" | grep -qiE "$GH_EDIT_BODY_AT_PATTERN"; then
+    deny "BLOCKED: 'gh pr edit'/'gh issue edit --body @path' does NOT expand the file — it writes the literal string '@path' as the issue/PR body (corrupted issue #4608's body this way). Use --body \"\$(cat <<'EOF' ... EOF)\", -F/--body-file <path>, or 'gh api ... -F body=@<path>' instead." "gh-edit-body-literal-at"
+fi
+
+# =============================================================================
+# The same literal-@ loss reached through SHELL-VARIABLE INDIRECTION (#4601)
+#
+# The #4523 rule above inspects only the STATIC text immediately following the
+# --body/-b flag, so it is blind to an identical `@path` value that arrives via
+# a shell variable. This recurred in the field on PR #4600 (~1h45m AFTER the
+# #4523 guard was live in the installed copy — so the guard was present and
+# simply did not cover the shape):
+#
+#   REVIEW_FILE="@/tmp/pr4600-review.md"; gh pr comment 4600 --body "$REVIEW_FILE"
+#
+# ...was ALLOWED and posted the literal path string as the comment again. This
+# is also the shape an agent naturally reaches for when the literal form is
+# denied — i.e. the deny above actively invites this bypass.
+#
+# An unconditional deny on `--body "$VAR"` would be far too broad: a legitimate
+# `--body "$SUMMARY"` carrying review prose has the identical shape. So this
+# rule CORRELATES instead — it denies only when the SAME command both
+#   (a) assigns a PATH-SHAPED `@…` value to a shell variable, and
+#   (b) passes that same variable as the --body/-b value.
+# That combination has no legitimate use, and `--body "$SUMMARY"` (no @path
+# assignment anywhere in the command) is untouched.
+#
+# COORDINATION (#4577): this is deliberately an ADDITIVE, separate check rather
+# than a widening of GH_COMMENT_BODY_AT_PATTERN above. #4577 is an open fix to
+# that same regex for the OPPOSITE failure direction (bare `@mention` reply
+# prose false-positived); keeping the two rules on separate lines means neither
+# fix can regress or textually conflict with the other. For the same reason
+# GH_AT_PATHISH requires actual path shape (an explicit `/`, `~/`, `./`, `../`
+# prefix, or a text-file extension), so bare `@mention` / `@org/team` prose
+# never matches it — this rule cannot widen #4577's false-positive surface.
+#
+# KNOWN LIMIT (by construction): a variable assigned in an EARLIER Bash call is
+# invisible in a single PreToolUse payload, and no static inspection can reach
+# it. That residual case is covered by the independent second defense layer —
+# the "re-fetch the posted comment and confirm it renders your prose, not a
+# path" step in judge.md's/doctor.md's pre-approval / pre-completion checklists.
+# =============================================================================
+# `@` followed by a genuinely path-shaped value. Two alternatives:
+#   1. an explicit path prefix — @/…, @~/…, @./…, @../…
+#   2. a bare relative path ending in a text-file extension — @review.md,
+#      @scratch/review.md
+# Deliberately NOT `@\S+`: that would match `@rjwalters`, `@org/team`, and
+# `@example.com` prose, i.e. exactly the #4577 false-positive family.
+GH_AT_PATHISH="@((/|~/|\.\.?/)[^[:space:]\"';&|]*|[^[:space:]\"';&|]*\.(md|markdown|txt|text|log|json|ya?ml|diff|patch|out))"
+
+# Both rules below require a literal `@` somewhere in the command, so this
+# bash-builtin prefilter keeps them entirely off the hot path for the vast
+# majority of commands (same pattern as the COMMAND_NO_LITERAL_TEXT /
+# COMMAND_NO_COMMENT `#`-present guards above).
+if [[ "$COMMAND" == *"@"* ]]; then
+    if echo "$COMMAND" | grep -qiE "(^|[;&|[:space:]])gh[[:space:]]+(pr|issue)[[:space:]]+comment"; then
+        # Names of variables assigned a path-shaped `@…` value in THIS command.
+        _gh_at_path_vars=$(printf '%s\n' "$COMMAND" \
+            | grep -oE "(^|[;&|(){}[:space:]])[A-Za-z_][A-Za-z0-9_]*=[\"']?$GH_AT_PATHISH" 2>/dev/null \
+            | grep -oE "[A-Za-z_][A-Za-z0-9_]*=" 2>/dev/null \
+            | tr -d '=' | sort -u)
+        for _gh_at_var in $_gh_at_path_vars; do
+            # ...and passed straight through as the --body/-b value ($V, ${V}, "$V").
+            if echo "$COMMAND" | grep -qiE "(-b|--body)[[:space:]]*=?[[:space:]]*[\"']?[\$]\{?${_gh_at_var}(\}|[^A-Za-z0-9_]|\$)"; then
+                deny "BLOCKED: '\$${_gh_at_var}' is assigned a path-shaped '@<path>' value and passed as --body — 'gh pr comment'/'gh issue comment' does NOT expand '@path' from a variable either; it posts the literal string as the comment (lost the PR #4457 review this way, recurred on PR #4600 through exactly this indirection). Use --body-file <path>, 'gh api ... -F body=@<path>', or --body \"\$(cat <<'EOF' ... EOF)\"." "gh-comment-body-literal-at-var"
+            fi
+        done
+    fi
+
+    # -------------------------------------------------------------------------
+    # Same shell-variable-indirection shape, `edit` subcommand (#4685). Kept as
+    # a separate parallel `if`/loop rather than folding `edit` into the
+    # `comment` subcommand regex above, for the identical #4577-precedent
+    # reason cited on GH_EDIT_BODY_AT_PATTERN.
+    # -------------------------------------------------------------------------
+    if echo "$COMMAND" | grep -qiE "(^|[;&|[:space:]])gh[[:space:]]+(pr|issue)[[:space:]]+edit"; then
+        _gh_at_path_vars_edit=$(printf '%s\n' "$COMMAND" \
+            | grep -oE "(^|[;&|(){}[:space:]])[A-Za-z_][A-Za-z0-9_]*=[\"']?$GH_AT_PATHISH" 2>/dev/null \
+            | grep -oE "[A-Za-z_][A-Za-z0-9_]*=" 2>/dev/null \
+            | tr -d '=' | sort -u)
+        for _gh_at_var in $_gh_at_path_vars_edit; do
+            if echo "$COMMAND" | grep -qiE "(-b|--body)[[:space:]]*=?[[:space:]]*[\"']?[\$]\{?${_gh_at_var}(\}|[^A-Za-z0-9_]|\$)"; then
+                deny "BLOCKED: '\$${_gh_at_var}' is assigned a path-shaped '@<path>' value and passed as --body — 'gh pr edit'/'gh issue edit' does NOT expand '@path' from a variable either; it writes the literal string as the issue/PR body (corrupted issue #4608's body this way). Use --body-file <path>, 'gh api ... -F body=@<path>', or --body \"\$(cat <<'EOF' ... EOF)\"." "gh-edit-body-literal-at-var"
+            fi
+        done
+    fi
+
+    # -------------------------------------------------------------------------
+    # `gh api … -f/--raw-field body=@path` — the same silent literal-@ loss.
+    #
+    # On `gh api`, ONLY `-F`/`--field` gives `@<path>` its read-from-file
+    # meaning. `-f`/`--raw-field` is a plain string parameter with no file
+    # expansion, so `gh api … -f body=@/tmp/review.md` posts the literal string
+    # `@/tmp/review.md` as the comment body — byte-for-byte the same silent data
+    # loss as the #4523 shape, on a surface that rule never inspected.
+    #
+    # CASE-SENSITIVE on purpose (grep -qE, NOT -qiE): `-i` would make `-f` match
+    # the documented CORRECT alternative `-F body=@path` and deny it. The
+    # leading whitespace anchor before the flag is likewise load-bearing —
+    # without it, `-f` matches inside `--field` (the long form of `-F`) and
+    # denies that too. GH_AT_PATHISH keeps `-f body="@mention …"` prose allowed.
+    #
+    # ENDPOINT SCOPE (#4685): this pattern was never anchored to a
+    # `/comments` endpoint — it matches `gh api <any-endpoint> ... -f
+    # body=@path` regardless of path — so it already covers `gh api
+    # repos/{o}/{r}/issues/{n}` (issue PATCH) and
+    # `repos/{o}/{r}/pulls/{n}` (PR PATCH) exactly as it covers
+    # `.../issues/{n}/comments`. Confirmed via the test suite's new
+    # non-comments-endpoint case; no widening was needed here.
+    # -------------------------------------------------------------------------
+    GH_API_RAWFIELD_BODY_AT_PATTERN="(^|[;&|[:space:]])gh[[:space:]]+api[^;&]*[[:space:]](-f|--raw-field)[[:space:]]*=?[[:space:]]*[\"']?body=[\"']?$GH_AT_PATHISH"
+    if echo "$COMMAND" | grep -qE "$GH_API_RAWFIELD_BODY_AT_PATTERN"; then
+        deny "BLOCKED: 'gh api ... -f/--raw-field body=@<path>' does NOT read the file — only -F/--field gives '@<path>' its read-from-file meaning. As written this posts the literal string '@<path>' as the body (same silent data loss as PR #4457/issue #4608). Use '-F body=@<path>' instead." "gh-api-rawfield-body-literal-at"
+    fi
+fi
+
+# =============================================================================
 # COMMENT-STRIPPED WORKING COPY - used ONLY for the ASK-word and SQL DDL/DML
 # matches below, never for the catastrophic ALWAYS_BLOCK scan.
 #
@@ -1888,6 +2051,95 @@ normalize_abs_path() {
     fi
 }
 
+# =============================================================================
+# expand_leading_tilde() — shell-accurate tilde expansion for write targets
+# (#4382, same fix family as the quote-aware `>` scanning of #4245/#4289).
+#
+# extract_write_targets() (below) is a plain-whitespace/quote-aware TOKENIZER,
+# not a shell evaluator — it never performs word expansions (tilde, variable,
+# glob, ...). A raw token like `~/.local/bin/x` was therefore resolved as a
+# REPO-RELATIVE path (cwd-prefixed) even though the real shell would expand it
+# to "$HOME/.local/bin/x" before `cp`/`mv`/`tee`/`sed -i`/redirection ever see
+# it — producing a false-positive worktree-confinement deny on a write that
+# actually lands far outside the repo (#4382).
+#
+# This performs ONLY the narrow, unambiguous piece of shell word-expansion
+# tilde-expansion applies to: an UNQUOTED, UNESCAPED tilde as the FIRST
+# character of the token, i.e. exactly the shell-eligible positions:
+#   ~/rest        -> "$HOME/rest"
+#   ~             -> "$HOME"
+#   ~user/rest    -> "<user's home>/rest"   (only if that user resolves)
+#   ~user         -> "<user's home>"
+#
+# Because qsplit() (the shared tokenizer, #3755) copies a quoted span
+# VERBATIM including its quote characters, and leaves a literal backslash
+# untouched, a token whose raw text does not start with a bare `~` was NOT
+# eligible for shell tilde-expansion and MUST stay untouched here:
+#   '~/x'   -> starts with a quote char, shell never expands it (stays literal)
+#   \~/x    -> starts with a literal backslash, shell never expands it either
+#   foo~/x  -> tilde is not the leading character -- not an expansion position
+# Any of these three cases falls through unchanged (echoed back as-is), which
+# preserves the existing (correct) repo-relative/deny behavior for them.
+#
+# `~user` lookup uses getent (Linux) / dscl (macOS) with the username passed
+# as a plain CLI argument (never eval'd/interpolated into a shell string) so a
+# hostile username token cannot inject a command. If the user cannot be
+# resolved on this host, the token is returned UNCHANGED (falls back to the
+# existing repo-relative treatment) -- consistent with this file's fail-open
+# contract: uncertainty here biases toward the (safe) deny path, never toward
+# a silent new allow.
+# =============================================================================
+expand_leading_tilde() {
+    local tok="$1"
+    # shellcheck disable=SC2088 # intentional: these `~`-prefixed case
+    # patterns are literal PATTERN matches against an unexpanded leading
+    # tilde in $tok (the whole point of this function), not an attempt at
+    # shell tilde expansion.
+    case "$tok" in
+        '~')
+            [[ -n "$HOME" ]] && { printf '%s' "$HOME"; return; }
+            printf '%s' "$tok"
+            return
+            ;;
+        '~/'*)
+            if [[ -n "$HOME" ]]; then
+                printf '%s' "$HOME/${tok#\~/}"
+            else
+                printf '%s' "$tok"
+            fi
+            return
+            ;;
+        '~'*)
+            local rest="${tok#\~}"
+            local user="${rest%%/*}"
+            local remainder=""
+            if [[ "$rest" == */* ]]; then
+                remainder="/${rest#*/}"
+            fi
+            if [[ -n "$user" ]]; then
+                local home=""
+                if command -v getent >/dev/null 2>&1; then
+                    home=$(getent passwd "$user" 2>/dev/null | cut -d: -f6)
+                elif command -v dscl >/dev/null 2>&1; then
+                    home=$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+                fi
+                if [[ -n "$home" ]]; then
+                    printf '%s' "${home}${remainder}"
+                    return
+                fi
+            fi
+            # Unresolvable ~user (unknown user / no lookup tool available):
+            # leave untouched -- falls back to repo-relative resolution.
+            printf '%s' "$tok"
+            return
+            ;;
+        *)
+            printf '%s' "$tok"
+            return
+            ;;
+    esac
+}
+
 # Cheap pre-check keeps awk off the hot path for the ~99% of commands that have
 # no recursive/force rm at all.
 if echo "$COMMAND" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
@@ -2049,17 +2301,38 @@ if worktree_isolation_guard_enabled && \
     # /tmp -> /private/tmp mismatch vs. normalize_abs_path's lexical-only form).
     # Fail open to REPO_ROOT if the git resolution is unavailable.
     _WT_MAIN_ROOT=""
+    _WT_MAIN_ROOT_LOGICAL=""
     if [[ -n "$CWD" && -d "$CWD" ]]; then
         _wt_common=$(cd "$CWD" 2>/dev/null && git rev-parse --git-common-dir 2>/dev/null) || _wt_common=""
         if [[ -n "$_wt_common" ]]; then
             _WT_MAIN_ROOT=$(cd "$CWD" 2>/dev/null && cd "$_wt_common/.." 2>/dev/null && pwd -P) || _WT_MAIN_ROOT=""
+            # ...and the LOGICAL spelling of the same root (symlinks intact).
+            # `pwd -P` alone was NOT sufficient (#4495): the write targets this
+            # block compares against are produced by normalize_abs_path(), which
+            # is lexical-only and therefore keeps a symlinked ancestor intact. A
+            # repo reached through a symlinked path (a `/tmp` checkout on macOS,
+            # a symlinked home, a bind-mounted workspace) produced targets that
+            # never string-matched the physical root, so EVERY Bash write into
+            # the main checkout was silently allowed there — the exact #4178
+            # escape this block exists to close. Both spellings are checked.
+            _WT_MAIN_ROOT_LOGICAL=$(cd "$CWD" 2>/dev/null && cd "$_wt_common/.." 2>/dev/null && pwd) || _WT_MAIN_ROOT_LOGICAL=""
         fi
     fi
     [[ -n "$_WT_MAIN_ROOT" ]] || _WT_MAIN_ROOT="$REPO_ROOT"
+    [[ -n "$_WT_MAIN_ROOT_LOGICAL" ]] || _WT_MAIN_ROOT_LOGICAL="$_WT_MAIN_ROOT"
 
     WRITE_TARGETS=$(extract_write_targets "$COMMAND_ASK_SCAN" "$CWD" | head -20)
     while IFS=$'\037' read -r _wcwd _wtarget; do
         [[ -z "$_wtarget" ]] && continue
+
+        # Shell-accurate tilde expansion (#4382): an unquoted/unescaped
+        # leading `~/` or `~user/` in the raw token is what the real shell
+        # would expand BEFORE cp/mv/tee/sed -i/redirection ever see it, so
+        # expand it here before the relative-path resolution below runs.
+        # Quoted ('~/x') / escaped (\~/x) tildes are left untouched (see
+        # expand_leading_tilde()'s doc comment) — no change to their
+        # existing repo-relative treatment.
+        _wtarget=$(expand_leading_tilde "$_wtarget")
 
         # Resolve to absolute; a relative target with no resolvable cwd is
         # ambiguous — skip it (allow on uncertainty, never deny on it).
@@ -2082,6 +2355,7 @@ if worktree_isolation_guard_enabled && \
         [[ -z "$_WT_MAIN_ROOT" ]] && continue
         case "$_wabs" in
             "$_WT_MAIN_ROOT"|"$_WT_MAIN_ROOT"/*) : ;;
+            "$_WT_MAIN_ROOT_LOGICAL"|"$_WT_MAIN_ROOT_LOGICAL"/*) : ;;
             *) continue ;;
         esac
 
