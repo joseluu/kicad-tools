@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import os
+import stat
 import tempfile
+from collections import Counter
 from datetime import date
 from pathlib import Path
 
 import pytest
+import yaml
 
 
 class TestUnitParsing:
@@ -851,3 +855,535 @@ class TestBackCompatExistingBoards:
         spec = load_spec(path)
         # Spec object is well-formed
         assert spec.project is not None
+
+
+# ---------------------------------------------------------------------------
+# Round-trip fidelity / append-only decision log (issue #4538)
+# ---------------------------------------------------------------------------
+
+_BOARD_DIRS = [
+    "00-simple-led",
+    "01-voltage-divider",
+    "02-charlieplex-led",
+    "03-usb-joystick",
+    "04-stm32-devboard",
+    "05-bldc-motor-controller",
+    "06-diffpair-test",
+    "07-matchgroup-test",
+]
+
+
+def _repo_board(board_dir: str) -> Path:
+    return Path(__file__).resolve().parent.parent / "boards" / board_dir / "project.kct"
+
+
+def _leaf_values(obj):
+    """Yield every scalar leaf of a parsed YAML tree, as strings."""
+    if isinstance(obj, dict):
+        for value in obj.values():
+            yield from _leaf_values(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            yield from _leaf_values(value)
+    else:
+        yield str(obj)
+
+
+class TestSpecRoundTripFidelity:
+    """A writer must never silently drop content it does not understand.
+
+    ``.kct`` files are human-authored and rewritten in place. Before #4538 the
+    spec models used pydantic's default ``extra="ignore"``, so a single
+    ``kct spec decide`` destroyed every key the schema did not define --
+    ``requirements.components``, ``progress.checklist``, and the unit-bearing
+    ``requirements.electrical`` / ``requirements.mechanical`` keys all vanished
+    with a zero exit code and no warning.
+    """
+
+    def test_unknown_top_level_key_survives_save(self, tmp_path):
+        from kicad_tools.spec import load_spec, save_spec
+
+        path = tmp_path / "p.kct"
+        path.write_text(
+            'kct_version: "1.0"\nproject:\n  name: "T"\ncustom_top_level:\n  nested: value\n',
+            encoding="utf-8",
+        )
+
+        spec = load_spec(path)
+        save_spec(spec, path)
+
+        reloaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert reloaded["custom_top_level"] == {"nested": "value"}
+
+    def test_explicitly_null_unknown_key_survives_save(self, tmp_path):
+        """``exclude_none`` must prune unset schema fields, never unknown keys."""
+        from kicad_tools.spec import load_spec, save_spec
+
+        path = tmp_path / "p.kct"
+        path.write_text(
+            'kct_version: "1.0"\n'
+            "project:\n"
+            '  name: "T"\n'
+            "mystery_key:\n"
+            "requirements:\n"
+            "  electrical:\n"
+            "    weird:\n"
+            "    keep: 5V\n",
+            encoding="utf-8",
+        )
+
+        save_spec(load_spec(path), path)
+
+        reloaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert "mystery_key" in reloaded
+        assert "weird" in reloaded["requirements"]["electrical"]
+        assert reloaded["requirements"]["electrical"]["keep"] == "5V"
+
+    def test_unknown_nested_key_survives_save(self, tmp_path):
+        from kicad_tools.spec import load_spec, save_spec
+
+        path = tmp_path / "p.kct"
+        path.write_text(
+            'kct_version: "1.0"\n'
+            "project:\n"
+            '  name: "T"\n'
+            "requirements:\n"
+            "  electrical:\n"
+            "    input_voltage: 5V\n"
+            "  components:\n"
+            "    - id: R1\n"
+            "      value: 330 ohm\n"
+            "progress:\n"
+            "  phase: concept\n"
+            "  checklist:\n"
+            '    - "[x] Schematic"\n',
+            encoding="utf-8",
+        )
+
+        spec = load_spec(path)
+        save_spec(spec, path)
+
+        reloaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert reloaded["requirements"]["electrical"]["input_voltage"] == "5V"
+        assert reloaded["requirements"]["components"] == [{"id": "R1", "value": "330 ohm"}]
+        assert reloaded["progress"]["checklist"] == ["[x] Schematic"]
+
+    @pytest.mark.parametrize("board_dir", _BOARD_DIRS)
+    def test_board_round_trip_loses_no_data(self, board_dir: str, tmp_path):
+        """load_spec -> save_spec with no mutation loses no leaf value.
+
+        The single tolerated difference is ``copper_weight``, which a
+        pre-existing field validator canonicalizes from ``"2oz"`` to the float
+        ``2.0``. That is a documented unit parse, not a dropped key.
+        """
+        from kicad_tools.spec import load_spec, save_spec
+
+        source = _repo_board(board_dir)
+        if not source.exists():
+            pytest.skip(f"project.kct not found at {source}")
+
+        before = yaml.safe_load(source.read_text(encoding="utf-8"))
+        out = tmp_path / "rt.kct"
+        save_spec(load_spec(source), out)
+        after = yaml.safe_load(out.read_text(encoding="utf-8"))
+
+        tolerated = set()
+        weight = (
+            (before.get("requirements") or {}).get("manufacturing", {}).get("copper_weight")
+            if isinstance(before.get("requirements"), dict)
+            else None
+        )
+        if weight is not None:
+            tolerated.add(str(weight))
+
+        missing = Counter(_leaf_values(before)) - Counter(_leaf_values(after))
+        assert not (set(missing) - tolerated), f"{board_dir}: lost leaf values {dict(missing)}"
+
+    def test_collect_unknown_keys_reports_schema_drift(self):
+        """Unknown keys are preserved, but they must not be invisible."""
+        from kicad_tools.spec import collect_unknown_keys, load_spec
+
+        source = _repo_board("00-simple-led")
+        if not source.exists():
+            pytest.skip(f"project.kct not found at {source}")
+
+        unknown = collect_unknown_keys(load_spec(source))
+
+        assert "requirements.components" in unknown
+        assert "progress.checklist" in unknown
+        assert "requirements.electrical.input_voltage" in unknown
+        assert "requirements.mechanical.board_width" in unknown
+
+    def test_validate_spec_detailed_warns_without_erroring(self):
+        from kicad_tools.spec import validate_spec_detailed
+
+        source = _repo_board("00-simple-led")
+        if not source.exists():
+            pytest.skip(f"project.kct not found at {source}")
+
+        is_valid, errors, warnings = validate_spec_detailed(source)
+
+        assert is_valid, errors
+        assert errors == []
+        assert any("requirements.components" in w for w in warnings)
+
+    @pytest.mark.parametrize(
+        "template_name", ["minimal", "power_supply", "sensor_board", "mcu_breakout"]
+    )
+    def test_template_parses_and_round_trips(self, template_name: str, tmp_path):
+        from kicad_tools.spec import get_template, load_spec, save_spec
+
+        content = get_template(template_name).format(date=date.today().isoformat())
+        path = tmp_path / "t.kct"
+        path.write_text(content, encoding="utf-8")
+
+        before = yaml.safe_load(content)
+        assert isinstance(before, dict), f"{template_name} template is not a YAML mapping"
+
+        save_spec(load_spec(path), path)
+        after = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+        missing = Counter(_leaf_values(before)) - Counter(_leaf_values(after))
+        assert not missing, f"{template_name}: lost leaf values {dict(missing)}"
+
+    @pytest.mark.parametrize(
+        "template_name", ["minimal", "power_supply", "sensor_board", "mcu_breakout"]
+    )
+    def test_template_carries_decisions_stub(self, template_name: str):
+        """Every scaffolded board starts with the design-memory log present."""
+        from kicad_tools.spec import get_template
+
+        content = get_template(template_name).format(date=date.today().isoformat())
+
+        assert "\ndecisions: []\n" in content
+        assert "kct spec decide" in content
+        assert "append" in content.lower()
+
+
+class TestAppendDecision:
+    """``kct spec decide`` must be append-only, not a whole-file rewrite."""
+
+    def _decision(self, topic: str = "PROBE"):
+        from kicad_tools.spec import Decision
+
+        return Decision(topic=topic, choice="C", rationale="R", date=date(2026, 1, 1))
+
+    @pytest.mark.parametrize("board_dir", _BOARD_DIRS)
+    def test_append_is_byte_level_additive_on_real_boards(self, board_dir: str, tmp_path):
+        """The only change to a real board file is the appended entry."""
+        from kicad_tools.spec import append_decision
+
+        source = _repo_board(board_dir)
+        if not source.exists():
+            pytest.skip(f"project.kct not found at {source}")
+
+        original = source.read_text(encoding="utf-8")
+        work = tmp_path / "project.kct"
+        work.write_text(original, encoding="utf-8")
+
+        append_decision(work, self._decision())
+        updated = work.read_text(encoding="utf-8")
+
+        # Every original line survives, in order, unmodified.
+        original_lines = original.splitlines()
+        updated_lines = updated.splitlines()
+        added = [line for line in updated_lines if line not in original_lines]
+        remaining = [line for line in updated_lines if line in original_lines]
+        assert remaining == original_lines, "existing lines were reordered or rewritten"
+        assert any("PROBE" in line for line in added)
+
+        # ... and the parsed data differs only by the appended decision.
+        before = yaml.safe_load(original)
+        after = yaml.safe_load(updated)
+        expected = dict(before)
+        expected["decisions"] = [*(before.get("decisions") or []), after["decisions"][-1]]
+        assert after == expected
+
+    def test_deciding_twice_leaves_the_first_entry_unchanged(self, tmp_path):
+        from kicad_tools.spec import append_decision
+
+        source = _repo_board("00-simple-led")
+        if not source.exists():
+            pytest.skip(f"project.kct not found at {source}")
+
+        work = tmp_path / "project.kct"
+        work.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+        pre_existing = yaml.safe_load(work.read_text(encoding="utf-8"))["decisions"]
+
+        append_decision(work, self._decision("FIRST"))
+        after_first = yaml.safe_load(work.read_text(encoding="utf-8"))["decisions"]
+
+        append_decision(work, self._decision("SECOND"))
+        after_second = yaml.safe_load(work.read_text(encoding="utf-8"))["decisions"]
+
+        assert after_first[: len(pre_existing)] == pre_existing
+        assert after_second[: len(after_first)] == after_first
+        assert [d["topic"] for d in after_second[-2:]] == ["FIRST", "SECOND"]
+
+    def test_creates_the_list_when_no_decisions_key_exists(self, tmp_path):
+        from kicad_tools.spec import append_decision
+
+        path = tmp_path / "p.kct"
+        path.write_text(
+            'kct_version: "1.0"\nproject:\n  name: "T"\nprogress:\n  phase: concept\n',
+            encoding="utf-8",
+        )
+
+        append_decision(path, self._decision())
+
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert [d["topic"] for d in data["decisions"]] == ["PROBE"]
+        assert data["project"]["name"] == "T"
+        assert data["progress"]["phase"] == "concept"
+
+    def test_appends_into_an_explicitly_empty_list(self, tmp_path):
+        from kicad_tools.spec import append_decision
+
+        path = tmp_path / "p.kct"
+        path.write_text(
+            'kct_version: "1.0"\n'
+            "project:\n"
+            '  name: "T"\n'
+            "decisions: []\n"
+            "progress:\n"
+            "  phase: concept\n",
+            encoding="utf-8",
+        )
+
+        append_decision(path, self._decision())
+
+        text = path.read_text(encoding="utf-8")
+        assert "progress:" in text
+        data = yaml.safe_load(text)
+        assert [d["topic"] for d in data["decisions"]] == ["PROBE"]
+        assert data["progress"]["phase"] == "concept"
+
+    def test_preserves_unknown_keys_that_follow_the_decisions_block(self, tmp_path):
+        from kicad_tools.spec import append_decision
+
+        path = tmp_path / "p.kct"
+        path.write_text(
+            'kct_version: "1.0"\n'
+            "project:\n"
+            '  name: "T"\n'
+            "requirements:\n"
+            "  electrical:\n"
+            "    input_voltage: 5V\n"
+            "  components:\n"
+            "    - id: R1\n"
+            "decisions:\n"
+            "  - topic: Existing\n"
+            "    choice: X\n"
+            "    rationale: |\n"
+            "      Multi-line rationale.\n"
+            "\n"
+            "      With a blank line.\n"
+            "\n"
+            "# trailing comment section\n"
+            "progress:\n"
+            "  phase: concept\n"
+            "  checklist:\n"
+            '    - "[x] Schematic"\n',
+            encoding="utf-8",
+        )
+
+        append_decision(path, self._decision())
+
+        text = path.read_text(encoding="utf-8")
+        assert "# trailing comment section" in text, "comments must survive an append"
+        data = yaml.safe_load(text)
+        assert data["requirements"]["electrical"]["input_voltage"] == "5V"
+        assert data["requirements"]["components"] == [{"id": "R1"}]
+        assert data["progress"]["checklist"] == ["[x] Schematic"]
+        assert [d["topic"] for d in data["decisions"]] == ["Existing", "PROBE"]
+        assert data["decisions"][0]["rationale"] == (
+            "Multi-line rationale.\n\nWith a blank line.\n"
+        )
+
+    # Shapes where the textual splice *succeeds* and still re-parses as valid
+    # YAML, but produces the wrong data -- so only the ``reparsed != expected``
+    # comparison in ``append_decision`` can catch them. Each entry is
+    # (source text, topics the splice alone would have written).
+    _UNSPLICEABLE_SHAPES = {
+        # A column-0 comment terminates the block scan early, so the entry is
+        # inserted *between* the two existing decisions instead of after them.
+        "comment_inside_block": (
+            'kct_version: "1.0"\n'
+            "project:\n"
+            '  name: "T"\n'
+            "decisions:\n"
+            "  - topic: First\n"
+            "    choice: A\n"
+            "    rationale: R1\n"
+            "# column-0 comment inside the decisions block\n"
+            "  - topic: Second\n"
+            "    choice: B\n"
+            "    rationale: R2\n"
+            "progress:\n"
+            "  phase: concept\n",
+            ["First", "PROBE", "Second"],
+            ["First", "Second", "PROBE"],
+        ),
+        # A quoted key misses the top-level-key regex, so the splice starts a
+        # *second* ``decisions:`` block; pyyaml resolves the duplicate
+        # last-wins and the pre-existing entry disappears silently.
+        "quoted_key": (
+            'kct_version: "1.0"\n'
+            "project:\n"
+            '  name: "T"\n'
+            '"decisions":\n'
+            "  - topic: First\n"
+            "    choice: A\n"
+            "    rationale: R1\n"
+            "progress:\n"
+            "  phase: concept\n",
+            ["PROBE"],
+            ["First", "PROBE"],
+        ),
+    }
+
+    @pytest.mark.parametrize("shape", sorted(_UNSPLICEABLE_SHAPES))
+    def test_unfaithful_splice_falls_back_to_a_structural_rewrite(self, shape, tmp_path):
+        """A splice that parses but says the wrong thing must never be written.
+
+        ``_splice_decision`` returns text for both of these shapes and that text
+        is valid YAML, so nothing but the ``reparsed != expected`` comparison in
+        :func:`append_decision` detects that it is wrong. Deleting that guard
+        makes this test fail.
+        """
+        from kicad_tools.spec import append_decision
+        from kicad_tools.spec.parser import _splice_decision
+
+        source, spliced_topics, expected_topics = self._UNSPLICEABLE_SHAPES[shape]
+
+        # The raw splice really does produce wrong data for this shape -- that
+        # is what makes the guard load-bearing rather than decorative.
+        entry = self._decision().model_dump(exclude_none=True, mode="json")
+        raw = _splice_decision(source, entry)
+        assert raw is not None, f"{shape}: splice declined, so it never reaches the guard"
+        assert [d["topic"] for d in yaml.safe_load(raw)["decisions"]] == spliced_topics
+
+        # append_decision must reject it and take the structural-rewrite path.
+        path = tmp_path / "p.kct"
+        path.write_text(source, encoding="utf-8")
+        append_decision(path, self._decision())
+
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert [d["topic"] for d in data["decisions"]] == expected_topics
+        # The rest of the file survives the fallback rewrite intact.
+        assert data["project"]["name"] == "T"
+        assert data["progress"]["phase"] == "concept"
+        assert data["kct_version"] == "1.0"
+
+    def test_malformed_spec_fails_loudly_without_truncating(self, tmp_path):
+        from kicad_tools.spec import append_decision
+
+        path = tmp_path / "p.kct"
+        original = "invalid: yaml: content: ["
+        path.write_text(original, encoding="utf-8")
+
+        with pytest.raises(ValueError):
+            append_decision(path, self._decision())
+
+        assert path.read_text(encoding="utf-8") == original
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+    @pytest.mark.parametrize("original_mode", [0o644, 0o664, 0o600])
+    def test_writing_preserves_the_files_permission_bits(self, original_mode, tmp_path):
+        """Neither write path may silently re-permission an existing ``.kct``.
+
+        The atomic write goes through ``tempfile.mkstemp`` (which creates its
+        file 0600) plus ``os.replace`` (which carries that mode onto the
+        target), so without an explicit chmod every save would narrow a normal
+        0644 spec to 0600 -- cumulatively and invisibly, since git tracks only
+        the exec bit.
+        """
+        from kicad_tools.spec import append_decision, load_spec, save_spec
+
+        path = tmp_path / "p.kct"
+        path.write_text(
+            'kct_version: "1.0"\n'
+            "project:\n"
+            '  name: "T"\n'
+            "decisions: []\n"
+            "progress:\n"
+            "  phase: concept\n",
+            encoding="utf-8",
+        )
+        os.chmod(path, original_mode)
+        assert stat.S_IMODE(path.stat().st_mode) == original_mode
+
+        append_decision(path, self._decision())
+        assert stat.S_IMODE(path.stat().st_mode) == original_mode, (
+            "append_decision changed the file's permission bits"
+        )
+
+        save_spec(load_spec(path), path)
+        assert stat.S_IMODE(path.stat().st_mode) == original_mode, (
+            "save_spec changed the file's permission bits"
+        )
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+    def test_new_file_permissions_follow_the_umask(self, tmp_path):
+        """A *created* spec gets ordinary umask permissions, not mkstemp's 0600.
+
+        The exact bits depend on the ambient umask, so this asserts equivalence
+        with what a plain ``Path.write_text`` produces in the same process
+        rather than pinning a literal mode.
+        """
+        from kicad_tools.spec import load_spec, save_spec
+
+        seed = tmp_path / "seed.kct"
+        seed.write_text(
+            'kct_version: "1.0"\nproject:\n  name: "T"\nprogress:\n  phase: concept\n',
+            encoding="utf-8",
+        )
+
+        reference = tmp_path / "reference.kct"
+        reference.write_text("x\n", encoding="utf-8")
+
+        created = tmp_path / "created.kct"
+        save_spec(load_spec(seed), created)
+
+        assert stat.S_IMODE(created.stat().st_mode) == stat.S_IMODE(reference.stat().st_mode)
+
+    def test_cli_decide_on_a_board_copy_is_append_only(self, tmp_path):
+        """End-to-end through the CLI handler, not just the library."""
+        from argparse import Namespace
+
+        from kicad_tools.cli.commands.spec import run_spec_command
+
+        source = _repo_board("00-simple-led")
+        if not source.exists():
+            pytest.skip(f"project.kct not found at {source}")
+
+        original = source.read_text(encoding="utf-8")
+        work = tmp_path / "project.kct"
+        work.write_text(original, encoding="utf-8")
+
+        rc = run_spec_command(
+            Namespace(
+                spec_command="decide",
+                spec_file=str(work),
+                decide_topic="CLI PROBE",
+                decide_choice="C",
+                decide_rationale="R",
+                decide_alternatives=None,
+            )
+        )
+
+        assert rc == 0
+        updated = work.read_text(encoding="utf-8")
+        # Every original line survives verbatim and in order; only the new
+        # entry's lines are added.
+        original_lines = original.splitlines()
+        kept = [line for line in updated.splitlines() if line in original_lines]
+        assert kept == original_lines, "decide rewrote bytes it was not asked to touch"
+        assert "CLI PROBE" in updated
+
+        before = yaml.safe_load(original)
+        after = yaml.safe_load(updated)
+        for key in before:
+            if key != "decisions":
+                assert after[key] == before[key], f"{key} changed"
+        assert after["decisions"][:-1] == before["decisions"]
