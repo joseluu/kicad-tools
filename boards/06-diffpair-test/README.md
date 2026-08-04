@@ -121,6 +121,112 @@ Per the Epic #2556 Phase 4L mitigation strategy, this board is scaffolded
 now with PCIe / MIPI pairs declared but DRC tolerated at "non-strict" if
 #2648 hasn't landed yet.  Re-route and tighten when #2648 merges.
 
+## Measuring Changes: the Shadow Phase Is Deterministic, Full Regen Is Not (#4536)
+
+Full board-06 regeneration (`generate_design.py --step route`) is
+run-to-run nondeterministic downstream of the coupled diff-pair
+pre-phase --- two same-seed runs of unmodified `main` can differ by
+thousands of lines ([#4536], open).  Every agent that measures a board-06
+change by diffing two full regens rediscovers this the hard way; this
+section exists so that discovery is a paragraph instead of a multi-hour
+detour.
+
+**The shadow-construction phase itself is fully deterministic.** This was
+established independently more than once during a 5-issue diffpair sweep
+(2026-08-03/04, [#4570]/[#4574]/[#4575]/[#4577]/[#4579]/[#4581]/[#4582]):
+two full runs at the same commit produce byte-identical sets of all 33
+`[coupled-tail]` lines, all 47 `[coupled-follow] declined` lines, and 323
+gate rejections from the #4575 via-clearance gate (split 3+15+68+107+82+7+34+7
+across the 9 pairs). The #4582 Judge independently reproduced the same
+323 figure across four separate runs spanning both downstream modes
+below. The nondeterminism is entirely downstream of this phase.
+
+Reproduce the shadow phase and its debug trace:
+
+```bash
+KCT_BOARD06_SHADOW=1 PYTHONHASHSEED=42 uv run python \
+  boards/06-diffpair-test/generate_design.py --step route --seed 42
+# KCT_SHADOW_DEBUG=1 adds the [coupled-tail] / [coupled-follow] instrumentation
+```
+
+### The two downstream modes
+
+**All figures in this subsection are from the shadow-ON configuration
+(`KCT_BOARD06_SHADOW=1`, the repro block above).  The default recipe
+runs shadow-OFF** --- `ENABLE_COUPLED_SHADOW` reads `KCT_BOARD06_SHADOW`
+with default `"0"` (`generate_design.py`, the #3508 block), which is what
+the committed artifact and CI use.
+
+Once shadow output feeds the negotiated `route_all_negotiated` pass, the
+shadow-ON board settles into one of two stable modes rather than a
+continuum:
+
+| (shadow-ON) | DRC errors | `diffpair_clearance_intra` | reach |
+|---|---|---|---|
+| Mode A | 32 | 7 | 19 of 21 |
+| Mode B | 35 | 19 | 18 of 21 |
+
+`coupled-ok` is 5/9 in both modes --- the shadow-ON convergence figure
+recorded in the recipe comments ("Convergence is 5/9 (post-#4576)").  A
+run's mode is identifiable from three mutually consistent signals ---
+total DRC error count, the `diffpair_clearance_intra` count, and reach
+--- which is what makes paired mode-for-mode comparison possible instead
+of guesswork.
+
+**If you ran with the default (shadow-OFF), you are not in either
+mode.** Expect the committed / CI floor instead: **18 DRC errors**
+(9 `diffpair_length_skew` + 9 `diffpair_routing_continuity`, the value
+pinned for this board in `.github/routed-drc-tolerance.yml`) at **21 of
+21** reach --- the shadow-OFF reach recorded in the same recipe
+comments.  A default-config run landing on those numbers is the expected
+result, not an unrecognized third mode.
+
+### Measurement convention
+
+- **Compare shadow-phase counters directly.** The `[coupled-tail]` /
+  `[coupled-follow] declined` line counts and the per-pair gate-rejection
+  split are deterministic; a difference there is a real signal.
+- **Compare full-regen (board-level) results paired mode-for-mode.**
+  Identify each side's mode from the three signals above before
+  comparing error counts, `diffpair_clearance_intra`, or reach across a
+  change.
+- **Never assert a delta from a single run of each side.** A lone
+  before/after pair can silently compare Mode A against Mode B and
+  report a mode flip as a regression or a win. Run enough repeats to
+  identify the mode on both sides first.
+
+Two traps this has already cost people:
+
+1. A Builder's first baseline landed in Mode A while the Curator's had
+   landed in Mode B, so the two disagreed on the "current" numbers and
+   neither was wrong.
+2. A Builder ran a narrow-vs-broad comparison that looked decisive and
+   was pure mode noise --- only paired sampling separated signal from
+   [#4536].
+
+### Standing invariants and the vacuity trap
+
+A change should not drop `coupled-ok` below 5/9, and should not drop
+reach when compared mode-for-mode.  **The 5/9 figure is the shadow-ON
+convergence number** recorded in the recipe comments next to
+`ENABLE_COUPLED_SHADOW`; like the mode table, it is an invariant for
+shadow-ON runs, so evaluate it against a shadow-ON baseline rather than
+a default (shadow-OFF) one.  Watch for the **vacuity trap**:
+`diffpair_length_skew` only fires on an *engaged* (coupled) pair, so a
+change that knocks a pair from coupled to declined removes it from
+skew-checking entirely --- the error count can drop while the change is
+a regression, not a win.  Always read `coupled-ok` and reach alongside
+the raw error count, never the error count alone.
+
+[#4536]: https://github.com/rjwalters/kicad-tools/issues/4536
+[#4570]: https://github.com/rjwalters/kicad-tools/issues/4570
+[#4574]: https://github.com/rjwalters/kicad-tools/issues/4574
+[#4575]: https://github.com/rjwalters/kicad-tools/issues/4575
+[#4577]: https://github.com/rjwalters/kicad-tools/issues/4577
+[#4579]: https://github.com/rjwalters/kicad-tools/issues/4579
+[#4581]: https://github.com/rjwalters/kicad-tools/issues/4581
+[#4582]: https://github.com/rjwalters/kicad-tools/issues/4582
+
 ## CI Gate (Phase 4N, #2660)
 
 This board is **re-routed from scratch on every pull request** by the
