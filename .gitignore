@@ -13,8 +13,15 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 .coverage.*
+# coverage.py writes its own htmlcov/.gitignore, so the tree is ignored only as
+# long as that generated file survives. Ignore it here too, or a `rm
+# htmlcov/.gitignore` (or a --cov-report=html run that predates it) stages
+# thousands of report files.
+htmlcov/
 *.egg-info/
 
 # Test byproducts

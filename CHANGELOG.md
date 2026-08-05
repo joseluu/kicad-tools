@@ -19,6 +19,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than KiCad's configurable silk clearance, so it under-reports rather
   than over-reports (#4612).
 
+- **Stem-keyed net-class-map sidecar auto-discovery** — `kct check` now probes
+  `<board-stem>.net_class_map.json` in addition to the bare
+  `net_class_map.json`, so board trees that keep several revisions side by side
+  (`board_v24.kicad_pcb` next to `board_v24.net_class_map.json`) no longer
+  silently skip the three gated rules (`match_group_length_skew`,
+  `diffpair_length_skew`, `diffpair_routing_continuity`). Within a directory the
+  stem-keyed name wins; the "rules are INACTIVE" warning now names the paths it
+  actually probed instead of an invented `output/` example. New
+  `--no-net-class-map` suppresses the probe (#4601).
+
+- **Opt-in crossover legality census** for the diff-pair shadow phase, behind
+  `KCT_CROSSTAIL_CENSUS=1`. Reports how many via-site candidates are legal and
+  how many distinct `v1` barrels they use, rather than stopping at the first
+  legal one. Default-off and byte-identical when unset (#4580).
+
+- **Full LVS mismatch records in machine output** — `kct check` now attaches the
+  complete record set from both comparator legs under `meta_checks.lvs`, reusing
+  the `lvs.json` shapes verbatim so one consumer parses
+  `boards/*/output/lvs.json` and the embedded form with the same code.
+  `--verbose` expands the `LVS:` stanza to the full uncapped list. Previously the
+  only form anywhere on that path was a truncated prose string (`"50
+  mismatch(es): a, b, c (+47 more)"`) — there was no way to see the other 47. The
+  default terminal line is unchanged (#4616).
+
+- **Per-part 3D-body transforms for the LCSC/EasyEDA model tier** — the
+  fetch-on-demand tier has no source footprint, so its body rotation was
+  underivable and defaulted to identity, which is wrong for any part whose STEP
+  is authored off-axis. Two override sources now resolve in
+  `models3d._resolve_lcsc` (sidecar > packaged table > identity, merged per
+  field): an object form in `lcsc_models.json` (`{"lib_id": {"lcsc": "C…",
+  "rotate": […], "offset": […]}}`, with the bare-string form still valid), and a
+  packaged C-number-keyed table. Every packaged entry must carry render
+  provenance, enforced by a test. Parts with no entry keep identity transforms,
+  so existing boards emit byte-identical model nodes (#4584).
+
 ### Changed
 
 - **`silk_over_copper` now counts one violation per (silk item, mask aperture)
@@ -32,6 +67,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the rule stopped at the first R-tree hit, so a refdes straddling four pads
   named one *arbitrary* member of the collision set (board 05 reported `U10
   pad 28`; the real set is pads 27, 28, 29, 30) (#4612).
+
+### Fixed
+
+- **`--net-class-map` was silently inert on every composition step.** On a
+  filtered routing pass (`--nets` / `--skip-nets`, and the `--region` /
+  `--complete` forms that imply `--preserve-existing`), sidecar keys were
+  resolved only against the nets being routed, so keys naming *preserved* nets
+  matched nothing and their clearances were dropped. `kct route` now resolves
+  against preserved nets as well, merging the two domains per field. Boards with
+  no preserved copper are byte-identical to before (#4622).
+
+- **LVS label-leg mismatches were discarded, not truncated, on copper-dirty
+  boards.** `_lvs_subcheck` computed the label-leg result and then early-returned
+  on a copper-dirty board before formatting it, so those mismatches were absent
+  from the terminal, `--format json`, and `-o report.json` alike. The
+  copper-dirty branch is now a detail-selection branch rather than a return. Exit
+  codes are unaffected — a copper-dirty board already failed (#4616).
 
 ### Known limitations
 
