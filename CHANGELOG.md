@@ -367,6 +367,19 @@ constructor). No breaking changes.
 
 ### Fixed
 
+- **Docs: board-07 placement-delta probe results corrected to CI ground
+  truth.** The board-07 README, the `generate_design.py` "MEASURED VERDICT"
+  comment block, and the `run()` docstring in `router/placement_feedback.py`
+  presented the U3-translate probe as a universal "+1 net (26/31 -> 27/31)
+  reverted for clearance" — that was a host-specific (local macOS arm64)
+  measurement. Both independent board-07 CI runs measured the probe as routed
+  25 -> 25 (refused for no reach gain; the clearance guard never fires there)
+  and probe 0 as 25 -> 14 (host: 25 -> 16). All three sites now carry both
+  measurements with host-vs-CI provenance, the README records the divergence
+  alongside the board-06 nondeterminism tracked in #4536, and `DQ4` /
+  `TMDS_D0_N` / `TMDS_D1_N` are now explicitly named unprobed-by-budget
+  rather than reading as unroutable. Text-only; no code, thresholds, or
+  routed artifacts changed (#4561).
 - **Legacy pre-#4600 generated `.kicad_dru` sidecars duplicated on merge.**
   The marker-guarded fab-floors merge (#4600) treated kct's own
   clobber-written, unmarked sidecars as user-authored and APPENDED a second
