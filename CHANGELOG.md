@@ -381,6 +381,20 @@ constructor). No breaking changes.
 
 ### Fixed
 
+- **Docs: the `enable_shadow_construction` comment block in
+  `router/diffpair.py` no longer cites pre-#3988 off-angle measurements.**
+  The 2026-07-08 #3921 snapshot (3/9 convergence; off-angle shadow segments
+  with a "pending" #3907 dogleg; open residuals #4570/#4574/#4575/#4577) is
+  re-framed as dated, resolved history: `_quantize_shadow_segments` (#3988)
+  doglegs shadow copper 45-legal at emission (verified 2026-07-31, zero
+  `OffAngleSegmentWarning` across all 9 board-06 pairs, #4461), construction
+  is 6/9 since #4460 (#4512/#4526), and the residuals are all closed. The
+  multiply-stale docstring of `test_shadow_construction_flag_defaults_off`
+  now states the current OFF rationale (USB_CC1 corridor contention + shadow-ON
+  wall-clock vs the 30-min CI ceiling, per the 2026-08-02 #4463 measurement).
+  The stale comment had already spawned near-duplicate work once (#4461 was
+  almost built as a new feature). Comment/docstring-only; zero executable-code
+  change (#4552).
 - **`route_cmd.main()` no longer leaks process-global state to in-process
   callers** (#4559). The route CLI stamps the `KICAD_TOOLS_STRICT_IN_PAD_CLEARANCE`
   / `KICAD_TOOLS_MICRO_VIA_IN_PAD_FALLBACK` (+ `_SIZE`/`_DRILL`) escalation
