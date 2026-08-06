@@ -392,6 +392,19 @@ constructor). No breaking changes.
 
 ### Fixed
 
+- **Batch completion and nudge re-route no longer drop newer `RescueConfig`
+  fields.** `complete_unfinished_nets` (`router/partial_rescue.py`) and the
+  post-nudge re-route (`router/placement_nudge.py`) rebuilt their per-pass
+  `RescueConfig` field-by-field, silently resetting any field added after the
+  copy was written: `allow_unsafe_grid` (#4528/#4532) was dropped at both
+  sites — so an unsafe-grid board's completion subprocess exited 1 at the CLI
+  gate before routing anything (bogus `no_output` failures) — and the nudge
+  path also lost `deterministic_budget` (#3877 cross-machine
+  reproducibility). Both sites now derive the pass config via
+  `dataclasses.replace` (helpers `_completion_pass_config` /
+  `_reroute_pass_config`), so future fields propagate by construction, and a
+  sentinel-based drift-guard test over `dataclasses.fields(RescueConfig)`
+  fails if a field is ever enumerated-but-not-propagated again (#4550).
 - **Docs: the `enable_shadow_construction` comment block in
   `router/diffpair.py` no longer cites pre-#3988 off-angle measurements.**
   The 2026-07-08 #3921 snapshot (3/9 convergence; off-angle shadow segments
