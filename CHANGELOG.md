@@ -17,6 +17,17 @@ constructor). No breaking changes.
 
 ### Added
 
+- **Mypy version-drift guard + worktree env sync** — fresh worktrees perform
+  no Python env setup, so a drifted `.venv` (e.g. mypy 1.20.2 vs the locked
+  1.19.1) surfaced toolchain diagnostics as phantom "NEW mypy errors beyond
+  the baseline". `scripts/ci/check_mypy_baseline.py` now compares the invoked
+  PATH `mypy --version` against the `uv.lock` pin and prints a warn-only
+  `MYPY VERSION DRIFT` diagnostic (banner when new-vs-baseline errors are
+  also present) naming the `uv sync --frozen --extra dev` remedy; exit-code
+  semantics are unchanged and the guard skips silently on an unreadable
+  lock. A new repo-owned `.loom/hooks/post-worktree.sh` hook runs
+  `uv sync --frozen --extra dev` automatically in Loom-created worktrees, and
+  the README "Fresh worktree checklist" documents the manual step. (#4558)
 - **`kct pcb add-3d-models --refresh` — rewrite existing `(model ...)` refs
   in place** (#4586) — the command was insert-only, so refs generated before
   a resolution fix (#4045 offsets, #4457/#4583 rotation baking, #4584 LCSC
