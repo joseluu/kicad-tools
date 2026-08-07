@@ -632,11 +632,33 @@ All commands support `--format json` for machine-readable output.
 | `mcp` | MCP server for AI agent integration |
 | `pcb.layout` | Layout preservation for PCB regeneration |
 
-## What's New (v0.19.0, July 2026)
+## What's New (v0.20.0, August 2026)
 
 Recent additions an agent reading these docs cold should know about. Older
 entries live in [CHANGELOG.md](CHANGELOG.md).
 
+- **Search-time HV pairwise clearance in the lattice engine** (v0.20.0) — with
+  `--voltage-map`, the lattice router now *avoids* HV↔LV proximity during
+  search instead of merely failing the post-route gate; KiCad keepout rule
+  areas are honored too, with a per-net-class `spatial_keepouts` sidecar
+  filter for declared HV-domain segregation.
+- **`kct sch tidy`** (v0.20.0) — headless autoplace of Reference/Value fields
+  (bbox-relative, rotation/mirror-aware) with `--refs`, `--threshold`,
+  `--dry-run`, and a strict cosmetic-only guarantee (netlist/BOM/ERC provably
+  unchanged). Pairs with the new `sch_fields` advisory lint in `kct check`
+  (`sch_field_offset` / `sch_field_overlap`).
+- **`kct net-status` strict by default** (v0.20.0) — connectivity now uses
+  real copper geometry (kicad-cli semantics) instead of endpoint proximity,
+  eliminating false opens on poured nets; `--legacy-proximity` restores the
+  old model, and `--strict --why` now compose.
+- **`kct pcb add-3d-models --refresh`** (v0.20.0) — re-resolve and rewrite
+  existing `(model ...)` refs in place through the current tier chain
+  (library → variant → substitution → LCSC sidecar); default remains
+  byte-identical insert-only.
+- **Board-edge keepout auto-resolution** (v0.20.0) — in-process routing via
+  `load_pcb_for_routing` now derives the board-edge keepout from the
+  manufacturer's `min_edge_clearance` automatically (explicit `0` opts out),
+  matching what the CLI already did.
 - **HV-isolation design loop** (v0.19.0) — `kct creepage --voltage-map` derives
   each conductor pair's required creepage from its own `|ΔV|` instead of one
   group working voltage; `kct zones hv-keepout` generates plane voids so inner

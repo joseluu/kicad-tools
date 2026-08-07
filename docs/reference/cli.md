@@ -158,6 +158,7 @@ kct sch <subcommand> <schematic> [options]
 | `pin-positions` | Get symbol pin positions |
 | `check-connections` | Check for unconnected pins |
 | `find-unconnected` | Find unconnected nets |
+| `tidy` | Autoplace Reference/Value fields (headless; `--refs`, `--threshold`, `--dry-run`, cosmetic-only) |
 
 **Examples:**
 ```bash
@@ -181,6 +182,7 @@ kct pcb <subcommand> <pcb_file> [options]
 | `query` | Query footprints and tracks |
 | `modify` | Modify PCB elements |
 | `add-zone` | Add a copper pour zone |
+| `add-3d-models` | Patch missing `(model ...)` refs; `--refresh` rewrites existing refs through the current tier chain (see [LCSC 3D models guide](../guides/lcsc-3d-models.md)) |
 
 **`add-zone` output-path behavior:** `-o`/`--output` is optional and
 **defaults to overwriting the input in place** — consistent with `zones add`,
@@ -1148,6 +1150,8 @@ kct net-status <pcb_file> [options]
 | `--net NET` | Check a specific net |
 | `--incomplete` | Show only incomplete / unrouted nets |
 | `--by-class` | Group output by net class |
+| `--legacy-proximity` | Use the pre-v0.20 endpoint-proximity model (default is strict real-copper geometry; mutually exclusive with `--strict`) |
+| `--why` | Explain each incomplete net (composes with the strict model) |
 | `-v`, `--verbose` | Per-segment / per-pad detail |
 
 Exit code semantics are reused by the `preflight-routing` step in
