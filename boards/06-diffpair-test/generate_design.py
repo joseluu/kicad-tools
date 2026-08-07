@@ -33,6 +33,7 @@ If no output directory is specified, files are written to ./output/.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -345,10 +346,35 @@ def _find_sexp_blocks(text: str, token: str) -> list[str]:
     return blocks
 
 
+# Issue #4536: sequence counter for deterministic repair-copper UUIDs.
+# Reset at the top of ``route_pcb`` so every regen mints the same sequence.
+_REPAIR_UUID_COUNTER = 0
+
+
+def _reset_repair_uuid_counter() -> None:
+    """Reset the deterministic repair-UUID sequence (start of a regen)."""
+    global _REPAIR_UUID_COUNTER
+    _REPAIR_UUID_COUNTER = 0
+
+
 def _generate_uuid() -> str:
+    """Deterministic UUID for pour-repair / bridge copper (#4536).
+
+    ``kicad-cli`` (invoked by every ``kct zones fill`` round of the repair
+    loop) re-saves the board with tracks ordered by UUID.  The #4536 regen
+    matrix showed that once the wall-clock sources were removed, the ONLY
+    remaining artifact difference between two same-seed runs was the file
+    order of the stitch/repair copper -- because these emitters minted
+    random ``uuid.uuid4()`` values, each refill sorted the identical
+    copper differently.  A uuid5 over a per-run sequence number is stable
+    run-to-run (the repair passes' call sequence is deterministic once
+    routing is) while staying unique within the artifact.
+    """
+    global _REPAIR_UUID_COUNTER
+    _REPAIR_UUID_COUNTER += 1
     import uuid as _uuid
 
-    return str(_uuid.uuid4())
+    return str(_uuid.uuid5(_uuid.NAMESPACE_OID, f"board06-pour-repair:{_REPAIR_UUID_COUNTER}"))
 
 
 def _audit_pour_nets(pcb_path: Path, net_names: list[str]) -> dict:
@@ -2224,6 +2250,11 @@ def route_pcb(input_path: Path, output_path: Path) -> bool:
     print("Routing PCB...")
     print("=" * 60)
 
+    # Issue #4536: repair-copper UUIDs are minted from a deterministic
+    # sequence (see ``_generate_uuid``); reset it so back-to-back regens
+    # in one process mint identical sequences.
+    _reset_repair_uuid_counter()
+
     # JLCPCB tier-1 design rules: 0.15mm trace / 0.15mm space / 0.3mm via.
     # Grid must be <= clearance/2 for DRC compliance (0.05 <= 0.15/2 = 0.075 OK).
     # Via diameter chosen tight (0.45mm) so escape vias fit between
@@ -2691,14 +2722,71 @@ def route_pcb(input_path: Path, output_path: Path) -> bool:
         # ``getattr(args, "per_net_timeout", None) or None`` -> None
         # (route_cmd.py:3272 etc.).
         #
-        # ``timeout=360.0`` is retained as an outer SAFETY BACKSTOP only -- it
-        # must NOT fire, or it re-introduces the load-dependent cutoff the
-        # iteration budget removes.  The negotiated loop's banking work
-        # completes well under 360s on this board (see the #3413 phase-6 note
-        # above).
+        # ``timeout=None`` (#4536): this stage previously carried a
+        # ``timeout=360.0`` wall-clock SAFETY BACKSTOP with a comment claiming
+        # it "must NOT fire".  Instrumented multi-run evidence (issue #4536,
+        # 4-run same-host matrix) showed the phase's natural runtime STRADDLES
+        # that value, so the backstop fired mid-iteration-4 in EVERY run -- at
+        # a load-dependent net boundary ("Timeout during reroute at net 0/19"
+        # vs "net 1/19", 363.1-367.0s) -- and the #3989 remaining-budget
+        # per-net caps additionally cut the iteration-4 zero-overflow recovery
+        # at load-dependent points (routed 9/18 vs 9/19), so the four baseline
+        # runs serialized four DISTINCT artifacts (different copper counts,
+        # 1599-1602 segments).  With ``timeout=None`` the routed copper became
+        # count- and content-identical run to run (byte-identical logs and
+        # step-8 serialization), leaving only the uuid-sort file-order
+        # residual fixed in ``_generate_uuid`` / ``_stitch_uuid`` (#4536).
+        # A finite backstop near the natural runtime re-introduces
+        # the straddle, and ANY finite ``timeout`` keeps the wall-clock
+        # per-net caps active (core.py derives them from the REMAINING stage
+        # budget each iteration, #3989) -- so determinism requires running
+        # this stage with no wall-clock budget at all.  The stage stays
+        # bounded by its deterministic iteration exits instead: the per-net
+        # 1M node-expansion budget wired into the Autorouter above, the 12M
+        # memory backstop, the ``max_iterations=3`` bound below, best-stall
+        # patience 2, and the #4463 zero-overflow fixed-point exit.
+        # ``tests/test_board06_determinism.py`` (gated behind
+        # ``KCT_BOARD06_DETERMINISM=1``) is the regression guard: two
+        # consecutive same-seed runs must produce identical uuid-normalized
+        # artifacts.
+        #
+        # ``max_iterations=3`` (#4536) -- LOAD-BEARING for RUNTIME; do not
+        # raise it back to the default 10 without re-measuring.  This is the
+        # DETERMINISTIC replacement for the truncation the 360 s backstop used
+        # to perform: in every instrumented run (4 local baselines + CI run
+        # 31214686048) the backstop fired at the very START of iteration 4
+        # ("Timeout during reroute at net 0/19" / "net 0/21"), so iterations
+        # 0-3 are exactly the work the historical artifact was built from.
+        # Removing the wall clock let iteration 4 run to completion, which
+        # cost +9.3 min locally and +14 min on CI (the Board-06 E2E job landed
+        # at 29m45s against its 30-min ceiling) and changed NOTHING: iteration
+        # 4 regresses to connected=11/21, the end-of-loop lex restore discards
+        # it, and the committed state is the iteration-2 snapshot either way.
+        # ``best_stall_patience=2`` would also have exited after iteration 4,
+        # so 3 gives up no convergence headroom -- it just stops paying for a
+        # round whose result is provably discarded.  A count-based bound is
+        # reproducible where the wall-clock cut was not (the baseline matrix
+        # cut mid-net at load-dependent boundaries: net 0/19 vs net 1/19).
+        #
+        # ``deterministic_rescue=True`` (#4536) -- LOAD-BEARING for
+        # ``REQUIRED_SIGNAL_REACH = 21`` in
+        # ``scripts/ci/check_diffpair_coverage.py``.  Reach on this board is
+        # decided at ITERATION 2 by ONE relief rescue (``MIPI_RST``): it rips
+        # 4 MIPI blockers, and the transaction commits only if all 4 re-land.
+        # Those re-lands were bounded by a flat 10 s wall clock that straddles
+        # their 8-12 s natural time on GitHub runners, so the SAME code landed
+        # 21/21 on one runner (CI run 31214686048: "MIPI_RST ROUTED via
+        # conflict-free relief path; 4/4 displaced victim(s) re-landed") and
+        # 20/21 on another (run 31213011136: "only 3/4 displaced victim(s)
+        # re-landed -- rolling back"), with the routing logs line-identical up
+        # to that point.  Bounding those sub-searches by the per-net
+        # node-expansion cap instead makes the commit/rollback decision
+        # machine-independent -- the point of this issue.
         return router.route_all_negotiated(
             per_net_timeout=None,
-            timeout=360.0,
+            timeout=None,
+            max_iterations=3,
+            deterministic_rescue=True,
             seed=42,
         )
 
@@ -3586,5 +3674,39 @@ def main() -> int:
         return 1
 
 
+def _reexec_with_pinned_hash_seed() -> None:
+    """Re-exec this script once with ``PYTHONHASHSEED=42`` pinned.
+
+    Issue #4536: pin the interpreter hash seed BY CONSTRUCTION before any
+    routing code runs.  The README's shadow/census repro commands export
+    ``PYTHONHASHSEED=42`` by hand, but a plain regen invocation did not.
+    This is defensive hygiene for every str-keyed set/dict iteration in
+    the in-process router AND the subprocess passes (``kct zones fill``,
+    ``kct stitch`` inherit the pinned env).  NOTE: the #4536 matrix
+    proved the pin alone is NOT sufficient for artifact byte-identity --
+    the residual ~2300-line reorder was driven by random uuid4 values on
+    stitch/repair copper being re-sorted by kicad-cli's UUID-ordered
+    board save (fixed via deterministic UUID minting in ``_generate_uuid``
+    here and ``_stitch_uuid`` in stitch_cmd.py).
+
+    ``PYTHONHASHSEED`` only takes effect at interpreter startup, so the
+    only way to pin it from inside the process is to re-exec.  The guard
+    makes the exec a no-op when the wrapper (or the re-exec itself)
+    already pinned it.
+
+    This MUST stay out of :func:`main` — ``os.execv`` replaces the whole
+    process, so calling it from ``main()`` would destroy any in-process
+    caller (e.g. the pytest workers in
+    ``tests/test_board_06_partial_route_fastfail.py``, which import this
+    module and call ``main()`` directly).  Only real CLI invocations,
+    where this script owns the process and ``sys.argv`` is its own, may
+    re-exec.
+    """
+    if os.environ.get("PYTHONHASHSEED") != "42":
+        os.environ["PYTHONHASHSEED"] = "42"
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 if __name__ == "__main__":
+    _reexec_with_pinned_hash_seed()
     sys.exit(main())

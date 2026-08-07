@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Board-06 regen is same-host run-to-run deterministic again** (#4536) —
+  two same-seed flag-OFF regens could differ by thousands of lines,
+  making the "flag-OFF run must produce a byte-identical committed
+  artifact" scope-guard convention undecidable for board-06. Two
+  instrumented run matrices localized two sources. **Dominant:** the
+  negotiated stage's `timeout=360.0` wall-clock backstop straddled the
+  phase's natural runtime (363–367 s) and fired mid-iteration at a
+  load-dependent net boundary in every run (different copper counts,
+  1599–1602 segments); with any finite stage timeout the #3989
+  remaining-budget per-net wall-clock caps also stayed active. Fixed:
+  `boards/06-diffpair-test/generate_design.py` now runs the negotiated
+  stage with `timeout=None` — bounded by its deterministic iteration
+  exits (per-net node-expansion budget, memory backstop, a
+  `max_iterations=3` count bound that reproduces where the wall clock
+  empirically cut, best-stall patience, #4463 zero-overflow
+  fixed-point) instead of wall clock — and pins `PYTHONHASHSEED=42` by
+  construction (one-shot re-exec at the entry point). **Reach-deciding:**
+  the relief rescue's probe / displaced-victim re-land sub-searches were
+  bounded by a flat 10 s wall clock that straddles their 8–12 s natural
+  time on CI runners; because a rescue rolls back entirely when a victim
+  does not re-land, that value decided routed reach on machine speed
+  alone (board-06 seed-42 landed 21/21 on one runner and 20/21 on
+  another from line-identical logs). `Autorouter.route_all_negotiated`
+  gained `deterministic_rescue=` (default off), which bounds those
+  sub-searches by the deterministic per-net node-expansion cap instead;
+  board 06 opts in. **Residual:** with
+  the wall clock removed, runs still serialized ~2300 differing lines
+  from *identical* copper multisets, because `kicad-cli` (invoked by
+  every `kct zones fill` round) re-saves the board with tracks ordered
+  by UUID and the stitch/pour-repair emitters minted random
+  `uuid.uuid4()` values. Fixed: `kct stitch` now mints content-derived
+  uuid5 values for its vias/stub segments, and board-06's pour-repair
+  `_generate_uuid` mints sequence-derived uuid5 values — all copper
+  UUIDs are deterministic, so file order is stable under kicad-cli
+  refills. A gated determinism smoke test
+  (`tests/test_board06_determinism.py`, enabled via
+  `KCT_BOARD06_DETERMINISM=1`; two ~12-minute regens) asserts two
+  consecutive same-seed runs produce identical uuid-normalized
+  artifacts; the normalization + scope-guard convention is documented in
+  `boards/06-diffpair-test/README.md`. A residual load-correlated
+  sensitivity (a stagnation-recovery reroute can flip under extreme
+  concurrent host load) is tracked separately as #4724.
+
 ### Added
 
 - **`kct check` now detects isolated copper natively: `isolated_copper`**
