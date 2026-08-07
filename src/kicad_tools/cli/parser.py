@@ -8,6 +8,7 @@ The parser is organized into subparsers for each major command category.
 import argparse
 
 from kicad_tools import __version__
+from kicad_tools.cli.format_options import add_format_flag
 from kicad_tools.manufacturers import get_all_manufacturer_names
 
 __all__ = ["create_parser"]
@@ -2976,22 +2977,26 @@ def _add_mfr_parser(subparsers) -> None:
     mfr_subparsers = mfr_parser.add_subparsers(dest="mfr_command", help="Manufacturer commands")
 
     # mfr list
-    mfr_subparsers.add_parser("list", help="List available manufacturers")
+    mfr_list = mfr_subparsers.add_parser("list", help="List available manufacturers")
+    add_format_flag(mfr_list)
 
     # mfr info
     mfr_info = mfr_subparsers.add_parser("info", help="Show manufacturer details")
     mfr_info.add_argument("manufacturer", help="Manufacturer ID (jlcpcb, seeed, etc.)")
+    add_format_flag(mfr_info)
 
     # mfr rules
     mfr_rules = mfr_subparsers.add_parser("rules", help="Show design rules")
     mfr_rules.add_argument("manufacturer", help="Manufacturer ID")
     mfr_rules.add_argument("-l", "--layers", type=int, default=4, help="Layer count")
     mfr_rules.add_argument("-c", "--copper", type=float, default=1.0, help="Copper weight (oz)")
+    add_format_flag(mfr_rules)
 
     # mfr compare
     mfr_compare = mfr_subparsers.add_parser("compare", help="Compare manufacturers")
     mfr_compare.add_argument("-l", "--layers", type=int, default=2, help="Layer count (default: 2)")
     mfr_compare.add_argument("-c", "--copper", type=float, default=1.0, help="Copper weight (oz)")
+    add_format_flag(mfr_compare)
 
     # mfr apply-rules
     mfr_apply = mfr_subparsers.add_parser(
@@ -3003,6 +3008,7 @@ def _add_mfr_parser(subparsers) -> None:
     mfr_apply.add_argument("-c", "--copper", type=float, default=1.0, help="Copper weight (oz)")
     mfr_apply.add_argument("-o", "--output", help="Output file (default: modify in place)")
     mfr_apply.add_argument("--dry-run", action="store_true", help="Show changes without applying")
+    add_format_flag(mfr_apply)
 
     # mfr validate
     mfr_validate = mfr_subparsers.add_parser(
@@ -3012,6 +3018,7 @@ def _add_mfr_parser(subparsers) -> None:
     mfr_validate.add_argument("manufacturer", help="Manufacturer ID (jlcpcb, seeed, etc.)")
     mfr_validate.add_argument("-l", "--layers", type=int, default=2, help="Layer count")
     mfr_validate.add_argument("-c", "--copper", type=float, default=1.0, help="Copper weight (oz)")
+    add_format_flag(mfr_validate)
 
     # mfr export-dru
     mfr_export_dru = mfr_subparsers.add_parser(
@@ -3023,6 +3030,7 @@ def _add_mfr_parser(subparsers) -> None:
         "-c", "--copper", type=float, default=1.0, help="Copper weight (oz)"
     )
     mfr_export_dru.add_argument("-o", "--output", type=str, help="Output file path")
+    add_format_flag(mfr_export_dru)
 
     # mfr import-dru
     mfr_import_dru = mfr_subparsers.add_parser(
@@ -3056,6 +3064,7 @@ def _add_zones_parser(subparsers) -> None:
     zones_add.add_argument("--min-thickness", type=float, default=0.25, help="Min thickness in mm")
     zones_add.add_argument("-v", "--verbose", action="store_true")
     zones_add.add_argument("--dry-run", action="store_true")
+    add_format_flag(zones_add)
 
     # zones list
     zones_list = zones_subparsers.add_parser("list", help="List existing zones")
@@ -3078,6 +3087,7 @@ def _add_zones_parser(subparsers) -> None:
     zones_batch.add_argument("--clearance", type=float, default=0.3, help="Clearance in mm")
     zones_batch.add_argument("-v", "--verbose", action="store_true")
     zones_batch.add_argument("--dry-run", action="store_true")
+    add_format_flag(zones_batch)
 
     # zones hv-keepout
     zones_hv = zones_subparsers.add_parser(
@@ -3115,6 +3125,7 @@ def _add_zones_parser(subparsers) -> None:
     )
     zones_hv.add_argument("-v", "--verbose", action="store_true")
     zones_hv.add_argument("--dry-run", action="store_true")
+    add_format_flag(zones_hv)
 
     # zones fill
     zones_fill = zones_subparsers.add_parser("fill", help="Fill all zones in a PCB")
@@ -3125,6 +3136,7 @@ def _add_zones_parser(subparsers) -> None:
     zones_fill.add_argument(
         "--dry-run", action="store_true", help="Show what would be done, no output"
     )
+    add_format_flag(zones_fill)
 
 
 def _add_stitch_parser(subparsers) -> None:
@@ -5409,6 +5421,7 @@ def _add_placement_parser(subparsers) -> None:
     placement_fix.add_argument(
         "-q", "--quiet", action="store_true", help="Suppress progress output"
     )
+    add_format_flag(placement_fix)
 
     # placement nudge (fast pad clearance repair)
     placement_nudge = placement_subparsers.add_parser(
@@ -5425,6 +5438,7 @@ def _add_placement_parser(subparsers) -> None:
     placement_nudge.add_argument(
         "-q", "--quiet", action="store_true", help="Suppress progress output"
     )
+    add_format_flag(placement_nudge)
 
     # placement optimize
     placement_optimize = placement_subparsers.add_parser(
@@ -5562,6 +5576,7 @@ def _add_placement_parser(subparsers) -> None:
     placement_snap.add_argument(
         "-q", "--quiet", action="store_true", help="Suppress progress output"
     )
+    add_format_flag(placement_snap)
 
     # placement align
     placement_align = placement_subparsers.add_parser(
@@ -5600,6 +5615,7 @@ def _add_placement_parser(subparsers) -> None:
     placement_align.add_argument(
         "-q", "--quiet", action="store_true", help="Suppress progress output"
     )
+    add_format_flag(placement_align)
 
     # placement distribute
     placement_distribute = placement_subparsers.add_parser(
@@ -5634,6 +5650,7 @@ def _add_placement_parser(subparsers) -> None:
     placement_distribute.add_argument(
         "-q", "--quiet", action="store_true", help="Suppress progress output"
     )
+    add_format_flag(placement_distribute)
 
     # placement suggest
     placement_suggest = placement_subparsers.add_parser(
@@ -8035,6 +8052,7 @@ def _add_spec_parser(subparsers) -> None:
         action="store_true",
         help="Overwrite existing file",
     )
+    add_format_flag(spec_init, dest="spec_format")
 
     # spec validate
     spec_validate = spec_subparsers.add_parser(
@@ -8047,6 +8065,7 @@ def _add_spec_parser(subparsers) -> None:
         metavar="FILE",
         help="Path to .kct file",
     )
+    add_format_flag(spec_validate, dest="spec_format")
 
     # spec status
     spec_status = spec_subparsers.add_parser(
@@ -8059,6 +8078,7 @@ def _add_spec_parser(subparsers) -> None:
         metavar="FILE",
         help="Path to .kct file",
     )
+    add_format_flag(spec_status, dest="spec_format")
 
     # spec decide
     spec_decide = spec_subparsers.add_parser(
@@ -8094,6 +8114,7 @@ def _add_spec_parser(subparsers) -> None:
         dest="decide_alternatives",
         help="Comma-separated alternative options considered",
     )
+    add_format_flag(spec_decide, dest="spec_format")
 
     # spec check
     spec_check = spec_subparsers.add_parser(
@@ -8111,6 +8132,7 @@ def _add_spec_parser(subparsers) -> None:
         metavar="ITEM",
         help="Checklist item to mark complete (format: 'phase.item' or 'item')",
     )
+    add_format_flag(spec_check, dest="spec_format")
 
 
 def _add_benchmark_parser(subparsers) -> None:
@@ -8160,6 +8182,7 @@ def _add_benchmark_parser(subparsers) -> None:
         action="store_true",
         help="Show detailed progress",
     )
+    add_format_flag(benchmark_run)
 
     # benchmark compare
     benchmark_compare = benchmark_subparsers.add_parser(
@@ -8183,6 +8206,7 @@ def _add_benchmark_parser(subparsers) -> None:
         action="store_true",
         help="Show detailed progress",
     )
+    add_format_flag(benchmark_compare)
 
     # benchmark report
     benchmark_report = benchmark_subparsers.add_parser(
@@ -8196,7 +8220,7 @@ def _add_benchmark_parser(subparsers) -> None:
     )
     benchmark_report.add_argument(
         "--format",
-        choices=["text", "markdown"],
+        choices=["text", "markdown", "json"],
         default="text",
         help="Output format (default: text)",
     )
