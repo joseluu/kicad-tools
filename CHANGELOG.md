@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`kct check` now detects isolated copper natively: `isolated_copper`**
+  (closes #4680, second slice — the dangling pair shipped separately
+  below) — a new `IsolatedCopperRule` (`validate/rules/zone_fill.py`,
+  CLI category `isolated_copper`) flags committed zone-fill islands
+  connected to nothing, closing the last of the three kicad-cli rule
+  classes previously invisible to a kct-only workflow (199 of the 268
+  missed findings on the reporting board). Each committed
+  `filled_polygon` is one island; an island is isolated when no
+  same-net pad, via, track segment, or track-arc touches its cluster
+  (same-layer same-net islands that touch each other are unioned first,
+  so an island bridged to anchored copper through a sibling island is
+  not a false positive). Detection consumes only the *committed* fill
+  polygons (this repo's copper source of truth): when zones were never
+  filled the rule degrades silently rather than presenting "0 isolated"
+  as a clean bill (`zone_unfilled` separately warns about those zones).
+  Findings are `severity="warning"` (KiCad default-severity parity —
+  `project_generator.py` already pins `isolated_copper: "warning"`),
+  classified reporting-advisory but NOT gating-advisory, with
+  kicad-cli-parity messages (`Zone [GNDD] on In1.Cu, priority 0`).
+  Cross-verified against `kicad-cli pcb drc` 10.0.5 on the committed
+  fills: 0/0 on all 8 repo boards (no false positives), and matching
+  zone/layer attribution + message shape on a synthetic orphan-island
+  fixture. **Known divergence** (documented in the module and pinned by
+  tests): KiCad's own predicate requires a *pad* in the island's cluster,
+  while this rule accepts any same-net copper touch — so kct's findings
+  are a strict *subset* of kicad-cli's (never a false positive, but an
+  island held only by pad-less copper is under-reported; on the synthetic
+  fixture kicad-cli counts 2 where kct counts 1). Full pad-cluster
+  semantics need transitive copper clustering with fills as conductors —
+  tracked as #4729. The shared per-layer copper indexing moved to a reusable
+  `build_copper_layer_indexes()` in `dangling_copper.py` so both #4680
+  detectors consult identical committed-copper geometry.
+
 - **`--format json` on the grouped-family subcommands (first #4674 batch:
   24 surfaces)** — the mechanical sweep executing #4543's canonical
   machine-output idiom, batch 1. `kct mfr
