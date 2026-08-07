@@ -1961,3 +1961,349 @@ def test_unnamed_net_fixture_kct_check_lvs_line_passes() -> None:
     )
     assert sub.status == "PASSED", f"LVS line: {sub.status} ({sub.detail})"
     assert sub.detail == "label + copper: 0 mismatch(es)"
+
+
+# ---------------------------------------------------------------------------
+# Endpoint-in-pad-copper bonding (issue #4678)
+# ---------------------------------------------------------------------------
+#
+# The legacy endpoint->pad bond required the segment endpoint to sit within
+# POSITION_TOLERANCE (0.01 mm) of the pad *center*.  A trace legally ending
+# inside pad copper but off-center stranded the pad -> a false LVS ``open``
+# that no flag could override (the tapeout Gate 1 wedge).  Step 2a3 bonds an
+# endpoint that lies inside the pad's eroded copper box (or whose trace
+# end-cap penetrates it by > 1 um) on a shared copper layer.
+
+
+def _pcb_endpoint_in_pad(
+    trace_end: tuple[float, float],
+    *,
+    trace_layer: str = "F.Cu",
+    width: float = 0.25,
+) -> str:
+    """Two-pad board: R1.1 (1x1 mm pad at 100,100) and R2.1 (at 110,100).
+
+    A single trace runs from R2.1's center to ``trace_end``.  With the
+    default geometry the endpoint lands *inside* R1.1's copper (box x in
+    [99.5, 100.5]) but 0.3 mm from the pad center — far beyond the legacy
+    0.01 mm center-proximity tolerance.
+    """
+    ex, ey = trace_end
+    return f"""(kicad_pcb
+  (version 20240108)
+  (generator "test")
+  (generator_version "8.0")
+  (general (thickness 1.6) (legacy_teardrops no))
+  (paper "A4")
+  (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+  (setup (pad_to_mask_clearance 0))
+  (net 0 "")
+  (net 1 "SIG")
+  (footprint "Resistor_SMD:R_0402_1005Metric"
+    (layer "F.Cu")
+    (uuid "00000000-0000-0000-0000-0000000000f1")
+    (at 100 100)
+    (property "Reference" "R1" (at 0 -1.5 0) (layer "F.SilkS") (uuid "fp-f1-ref"))
+    (property "Value" "1k" (at 0 1.5 0) (layer "F.Fab") (uuid "fp-f1-val"))
+    (pad "1" smd roundrect (at 0 0) (size 1 1) (layers "F.Cu" "F.Paste" "F.Mask")
+      (roundrect_rratio 0.25) (net 1 "SIG"))
+  )
+  (footprint "Resistor_SMD:R_0402_1005Metric"
+    (layer "F.Cu")
+    (uuid "00000000-0000-0000-0000-0000000000f2")
+    (at 110 100)
+    (property "Reference" "R2" (at 0 -1.5 0) (layer "F.SilkS") (uuid "fp-f2-ref"))
+    (property "Value" "1k" (at 0 1.5 0) (layer "F.Fab") (uuid "fp-f2-val"))
+    (pad "1" smd roundrect (at 0 0) (size 1 1) (layers "F.Cu" "F.Paste" "F.Mask")
+      (roundrect_rratio 0.25) (net 1 "SIG"))
+  )
+  (segment (start 110 100) (end {ex} {ey}) (width {width}) (layer "{trace_layer}") (net 1)
+    (uuid "00000000-0000-0000-0000-0000000000f3"))
+)
+"""
+
+
+_ENDPOINT_SCHEMATIC: dict[tuple[str, str], str | None] = {
+    ("R1", "1"): "SIG",
+    ("R2", "1"): "SIG",
+}
+
+
+@requires_shapely
+def test_endpoint_inside_pad_copper_off_center_bonds(tmp_path: Path) -> None:
+    """Repro of the #4678 false open: endpoint in pad copper, off-center.
+
+    The trace ends at (100.3, 100) — inside R1.1's 1x1 mm copper box but
+    0.3 mm from the pad center (30x the legacy tolerance).  The pads must
+    land in ONE component: this is real galvanic contact, and kicad-cli,
+    ``kct net-status`` (strict) and ``kct route --complete`` all agree.
+    """
+    pcb_path = _write(tmp_path, "b.kicad_pcb", _pcb_endpoint_in_pad((100.3, 100.0)))
+    partition = ConnectivityValidator(pcb_path).extract_pad_partition()
+    assert frozenset({"R1.1", "R2.1"}) in partition, f"partition={partition}"
+    assert len(partition) == 1
+
+
+@requires_shapely
+def test_endpoint_in_pad_lvs_leg_reports_connected(tmp_path: Path) -> None:
+    """The LVS copper diff is CLEAN on the #4678 repro (no false open)."""
+    pcb_path = _write(tmp_path, "b.kicad_pcb", _pcb_endpoint_in_pad((100.3, 100.0)))
+    partition = ConnectivityValidator(pcb_path).extract_pad_partition()
+    result = compare_partitions(_ENDPOINT_SCHEMATIC, partition)
+    assert result.clean, f"expected clean LVS, got {result.mismatches}"
+
+
+@requires_shapely
+def test_endpoint_outside_pad_across_clearance_gap_does_not_bond(
+    tmp_path: Path,
+) -> None:
+    """Negative guard: an endpoint across a clearance moat must NOT bond.
+
+    The trace ends at (100.75, 100): R1.1's copper edge is at x=100.5, the
+    0.25 mm-wide trace's end-cap reaches back to x=100.625, leaving a
+    0.125 mm copper-to-copper clearance gap.  Bonding here would fabricate
+    a connection across legal clearance — masking real opens (and, with a
+    foreign net, minting false connects).  SIG must stay split (a real open).
+    """
+    pcb_path = _write(tmp_path, "b.kicad_pcb", _pcb_endpoint_in_pad((100.75, 100.0)))
+    partition = ConnectivityValidator(pcb_path).extract_pad_partition()
+    assert frozenset({"R1.1"}) in partition, f"partition={partition}"
+    result = compare_partitions(_ENDPOINT_SCHEMATIC, partition)
+    assert not result.clean
+    assert any(m.net_a == "SIG" for m in result.opens)
+
+
+@requires_shapely
+def test_endpoint_in_pad_layer_gate_preserved(tmp_path: Path) -> None:
+    """A B.Cu trace ending under an F.Cu-only pad's copper must NOT bond.
+
+    Preserves the softstart false-short fix: XY overlap across disjoint
+    copper layers is not a connection — a trace may legally run (and end)
+    directly under an SMD pad on another layer.
+    """
+    pcb_path = _write(
+        tmp_path,
+        "b.kicad_pcb",
+        _pcb_endpoint_in_pad((100.3, 100.0), trace_layer="B.Cu"),
+    )
+    partition = ConnectivityValidator(pcb_path).extract_pad_partition()
+    assert frozenset({"R1.1"}) in partition, f"partition={partition}"
+
+
+def test_endpoint_in_pad_shapely_absent_falls_back_to_legacy(tmp_path: Path) -> None:
+    """Core-only installs (no shapely) keep the legacy behavior, no crash."""
+    from unittest import mock
+
+    pcb_path = _write(tmp_path, "b.kicad_pcb", _pcb_endpoint_in_pad((100.3, 100.0)))
+    with mock.patch("kicad_tools.validate.connectivity._has_shapely", return_value=False):
+        partition = ConnectivityValidator(pcb_path).extract_pad_partition()
+    # Legacy center-proximity model: the off-center endpoint does not bond,
+    # so the pads stay split (the historical false open) — but nothing raises.
+    assert frozenset({"R1.1"}) in partition
+    assert frozenset({"R2.1"}) in partition
+
+
+@requires_shapely
+def test_endpoint_in_pad_bond_carries_across_segment_chain(tmp_path: Path) -> None:
+    """The 2a3 bond joins the pad to the WHOLE chain, not just one segment.
+
+    R2.1 -> corner -> (100.3, 100) via two chained segments: the endpoint-in-
+    pad bond on the second segment must connect R1.1 to R2.1 through the
+    chain component (the ``segment_extra_nodes`` plumbing, mirroring 2a2).
+    """
+    pcb = _pcb_endpoint_in_pad((100.3, 100.0))
+    # Replace the single segment with a two-segment chain through a corner.
+    pcb = pcb.replace(
+        '  (segment (start 110 100) (end 100.3 100.0) (width 0.25) (layer "F.Cu") (net 1)\n'
+        '    (uuid "00000000-0000-0000-0000-0000000000f3"))\n',
+        '  (segment (start 110 100) (end 105 95) (width 0.25) (layer "F.Cu") (net 1)\n'
+        '    (uuid "00000000-0000-0000-0000-0000000000f3"))\n'
+        '  (segment (start 105 95) (end 100.3 100.0) (width 0.25) (layer "F.Cu") (net 1)\n'
+        '    (uuid "00000000-0000-0000-0000-0000000000f4"))\n',
+    )
+    assert "(end 105 95)" in pcb, "chain rewrite did not apply"
+    pcb_path = _write(tmp_path, "b.kicad_pcb", pcb)
+    partition = ConnectivityValidator(pcb_path).extract_pad_partition()
+    assert frozenset({"R1.1", "R2.1"}) in partition, f"partition={partition}"
+
+
+# ---------------------------------------------------------------------------
+# Diagonal near-miss on a ROUND pad (PR #4710 review counterexamples)
+# ---------------------------------------------------------------------------
+#
+# Modelling a pad by its size box over-reaches real copper on the diagonals:
+# for a circle of diameter d the eroded box corner sits (d/2 - 0.1)*sqrt(2)
+# from the center, i.e. 0.211 mm past the true copper edge on a 1.7 mm header
+# pad — more than the 0.1016 mm minimum clearance.  A trace endpoint (step 2a3
+# tests EVERY segment endpoint, including 45-degree bend vertices) landing in
+# that phantom corner zone measured ``dist == 0`` and bonded at DRC-clean
+# copper gaps up to ~0.21 mm.  Both dangerous directions are pinned below;
+# the fix is the shape-aware pad outline (circle -> disk, oval -> stadium).
+
+_DIAG = 0.7071067811865476  # cos(45 deg) = sin(45 deg)
+
+
+def _pcb_diagonal_near_miss_round_pad(
+    gap: float,
+    *,
+    trace_net: int = 1,
+    pad_shape: str = "circle",
+    pad_size: tuple[float, float] = (1.7, 1.7),
+    width: float = 0.25,
+) -> str:
+    """Round THT pad J1.1 (net SIG) with a trace bending past it at 45 deg.
+
+    ``J1`` is a ``pad_shape`` / ``pad_size`` through-hole pad at (100, 100);
+    ``R9.1`` is a distant pad.  The trace's bend vertex sits on the
+    45-degree diagonal at exactly ``gap`` mm of copper-to-copper clearance
+    from the pad's TRUE copper outline: for a circle the outline radius is
+    ``min(size) / 2`` about the center; for an oval it is the same radius
+    about the nearer stadium end-cap center (``(w - h) / 2`` along the long
+    axis).  The vertex is placed ``radius + gap + width / 2`` from that
+    center, so the trace's own rounded end-cap (radius ``width / 2``) stops
+    ``gap`` mm short of the copper.  With ``gap > 0.1016`` the board is
+    DRC-clean, so NO bond may ever fire; with ``gap < 0`` the end-cap is
+    genuinely inside the pad copper and the bond MUST fire.
+
+    ``trace_net`` selects the direction of the hazard: net 1 (``SIG``, the
+    pad's own net) reproduces the *masked real open*; net 2 (``OTHER``)
+    reproduces the *phantom short*.
+    """
+    w, h = pad_size
+    radius = min(w, h) / 2.0
+    # Anchor: the stadium end-cap center the diagonal radiates from (the pad
+    # center itself for a circle, where the two coincide).
+    ax = 100.0 + abs(w - h) / 2.0 if w >= h else 100.0
+    ay = 100.0 if w >= h else 100.0 + abs(w - h) / 2.0
+    reach = radius + gap + width / 2.0
+    vx = ax + reach * _DIAG
+    vy = ay + reach * _DIAG
+    pad_diameter = f"{w} {h}"
+    net_name = "SIG" if trace_net == 1 else "OTHER"
+    return f"""(kicad_pcb
+  (version 20240108)
+  (generator "test")
+  (generator_version "8.0")
+  (general (thickness 1.6) (legacy_teardrops no))
+  (paper "A4")
+  (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+  (setup (pad_to_mask_clearance 0))
+  (net 0 "")
+  (net 1 "SIG")
+  (net 2 "OTHER")
+  (footprint "Connector:PinHeader_1x01"
+    (layer "F.Cu")
+    (uuid "00000000-0000-0000-0000-0000000000d1")
+    (at 100 100)
+    (property "Reference" "J1" (at 0 -1.5 0) (layer "F.SilkS") (uuid "fp-d1-ref"))
+    (property "Value" "Conn" (at 0 1.5 0) (layer "F.Fab") (uuid "fp-d1-val"))
+    (pad "1" thru_hole {pad_shape} (at 0 0) (size {pad_diameter}) (drill 1.0)
+      (layers "*.Cu" "*.Mask") (net 1 "SIG"))
+  )
+  (footprint "Resistor_SMD:R_0402_1005Metric"
+    (layer "F.Cu")
+    (uuid "00000000-0000-0000-0000-0000000000d2")
+    (at 110 110)
+    (property "Reference" "R9" (at 0 -1.5 0) (layer "F.SilkS") (uuid "fp-d2-ref"))
+    (property "Value" "1k" (at 0 1.5 0) (layer "F.Fab") (uuid "fp-d2-val"))
+    (pad "1" smd roundrect (at 0 0) (size 1 1) (layers "F.Cu" "F.Paste" "F.Mask")
+      (roundrect_rratio 0.25) (net {trace_net} "{net_name}"))
+  )
+  (segment (start 110 110) (end {vx:.6f} {vy:.6f}) (width {width}) (layer "F.Cu")
+    (net {trace_net}) (uuid "00000000-0000-0000-0000-0000000000d3"))
+)
+"""
+
+
+_DIAG_SCHEMATIC_SAME_NET: dict[tuple[str, str], str | None] = {
+    ("J1", "1"): "SIG",
+    ("R9", "1"): "SIG",
+}
+
+_DIAG_SCHEMATIC_FOREIGN_NET: dict[tuple[str, str], str | None] = {
+    ("J1", "1"): "SIG",
+    ("R9", "1"): "OTHER",
+}
+
+
+@requires_shapely
+def test_diagonal_near_miss_round_pad_same_net_stays_open(tmp_path: Path) -> None:
+    """A 0.13 mm diagonal copper gap on a 1.7 mm round pad must stay OPEN.
+
+    PR #4710 review counterexample 1 (the silent one): the box model bonded
+    ``{J1.1, R9.1}`` here and reported a CLEAN LVS diff, masking a genuine
+    open that kicad-cli and strict ``kct net-status`` both flag.  The gap is
+    DRC-clean (0.13 mm > 0.1016 mm), so the endpoint is NOT in copper.
+    """
+    pcb_path = _write(tmp_path, "b.kicad_pcb", _pcb_diagonal_near_miss_round_pad(0.13, trace_net=1))
+    partition = ConnectivityValidator(pcb_path).extract_pad_partition()
+    assert frozenset({"J1.1"}) in partition, f"partition={partition}"
+    result = compare_partitions(_DIAG_SCHEMATIC_SAME_NET, partition)
+    assert not result.clean, "0.13 mm diagonal gap must remain a real open"
+    assert any(m.net_a == "SIG" for m in result.opens)
+
+
+@requires_shapely
+def test_diagonal_near_miss_round_pad_foreign_net_no_phantom_short(
+    tmp_path: Path,
+) -> None:
+    """A foreign-net trace bending past at 0.15 mm must NOT merge the pad.
+
+    PR #4710 review counterexample 2 (the loud one, and the mirror image of
+    the #4678 defect): the box model fused ``J1.1`` (SIG) with ``R9.1``
+    (OTHER) across a DRC-legal 0.15 mm clearance gap, so the LVS leg reported
+    a short that does not exist and would wedge a clean board.
+    """
+    pcb_path = _write(tmp_path, "b.kicad_pcb", _pcb_diagonal_near_miss_round_pad(0.15, trace_net=2))
+    partition = ConnectivityValidator(pcb_path).extract_pad_partition()
+    assert frozenset({"J1.1"}) in partition, f"partition={partition}"
+    assert not any({"J1.1", "R9.1"} <= set(component) for component in partition), (
+        f"phantom short: partition={partition}"
+    )
+    result = compare_partitions(_DIAG_SCHEMATIC_FOREIGN_NET, partition)
+    assert not result.shorts, f"phantom short reported: {result.shorts}"
+
+
+@requires_shapely
+def test_diagonal_endpoint_inside_round_pad_copper_still_bonds(tmp_path: Path) -> None:
+    """The shape-aware outline must not over-shrink: real contact still bonds.
+
+    Same 45-degree diagonal geometry, but the endpoint is driven 0.3 mm
+    *inside* the round pad's copper (negative gap) — genuine galvanic
+    contact, exactly the #4678 case the 2a3 step exists to recover.
+    """
+    pcb_path = _write(tmp_path, "b.kicad_pcb", _pcb_diagonal_near_miss_round_pad(-0.3, trace_net=1))
+    partition = ConnectivityValidator(pcb_path).extract_pad_partition()
+    assert frozenset({"J1.1", "R9.1"}) in partition, f"partition={partition}"
+    result = compare_partitions(_DIAG_SCHEMATIC_SAME_NET, partition)
+    assert result.clean, f"expected clean LVS, got {result.mismatches}"
+
+
+@requires_shapely
+def test_diagonal_near_miss_oval_pad_stays_open(tmp_path: Path) -> None:
+    """The same phantom-corner hazard exists on OVAL pads (stadium model).
+
+    A 2.6 x 1.8 mm oval THT pad's eroded box corner sits at (1.2, 0.8) from
+    center, 0.231 mm past the true stadium copper — well over min clearance.
+    The endpoint here has a DRC-clean 0.13 mm gap to the real outline yet
+    lands inside the eroded box, so the box model bonded it.
+    """
+    pcb_path = _write(
+        tmp_path,
+        "b.kicad_pcb",
+        _pcb_diagonal_near_miss_round_pad(0.13, trace_net=1, pad_shape="oval", pad_size=(2.6, 1.8)),
+    )
+    partition = ConnectivityValidator(pcb_path).extract_pad_partition()
+    assert frozenset({"J1.1"}) in partition, f"partition={partition}"
+
+
+@requires_shapely
+def test_endpoint_inside_oval_pad_copper_still_bonds(tmp_path: Path) -> None:
+    """Stadium erosion must not over-shrink: real oval-pad contact bonds."""
+    pcb_path = _write(
+        tmp_path,
+        "b.kicad_pcb",
+        _pcb_diagonal_near_miss_round_pad(-0.3, trace_net=1, pad_shape="oval", pad_size=(2.6, 1.8)),
+    )
+    partition = ConnectivityValidator(pcb_path).extract_pad_partition()
+    assert frozenset({"J1.1", "R9.1"}) in partition, f"partition={partition}"
