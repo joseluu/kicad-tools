@@ -7,7 +7,7 @@ who want a *real* (C++ A* backed) evaluator pull from this package.
 
 See :class:`CppAstarRoutingEvaluator` for the production implementation
 that backs the cascaded place-and-route flow (Issue #2719 / Epic
-spheresemi/sphere#7199 KiCad-1).
+#7199 in a private repo, KiCad-1).
 """
 
 from __future__ import annotations

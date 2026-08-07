@@ -1,7 +1,7 @@
 """Concrete ``RoutingEvaluator`` backed by C++ A* + EvolutionaryRoutingOptimizer.
 
 This is the production *inner loop* of the cascaded place-and-route epic
-(spheresemi/sphere#7199, KiCad-1 / Issue #2719).  Until now the
+(#7199 in a private repo, KiCad-1 / Issue #2719).  Until now the
 :class:`kicad_tools.optim.evolutionary.RoutingEvaluator` Protocol only had a
 ``_MockRoutingEvaluator`` test double — the placement GA could *call* an
 evaluator if one was injected, but no concrete implementation existed.

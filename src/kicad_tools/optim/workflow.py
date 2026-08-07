@@ -211,7 +211,7 @@ class WorkflowConfig:
     # ``CppAstarRoutingEvaluator`` from the loaded PCB and inject it into the
     # placement GA so the routability term is computed by *actual* C++ A*
     # routing (the inner loop of the cascaded architecture, epic
-    # spheresemi/sphere#7199) instead of the average-pairwise-spacing proxy.
+    # #7199 in a private repo) instead of the average-pairwise-spacing proxy.
     #
     # Default ``False`` keeps existing production runs unchanged until the
     # A/B benchmark validates this signal.  Has no effect on the

@@ -1,7 +1,7 @@
 # Placement GA Routability A/B Benchmark
 
 **Issue**: [#2720](https://github.com/rjwalters/kicad-tools/issues/2720) — KiCad-2: replace placement GA's spacing proxy with inner-loop routing quality (outer-loop swap)
-**Epic**: spheresemi/sphere#7199 — Cascaded optimization architecture for place-and-route
+**Epic**: #7199 in a private repo — Cascaded optimization architecture for place-and-route
 **Date**: 2026-05-17
 
 ## Summary

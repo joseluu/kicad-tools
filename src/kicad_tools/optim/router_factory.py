@@ -3,7 +3,7 @@
 This module provides the **router factory** that the placement GA's outer loop
 uses when injecting :class:`~kicad_tools.router.evaluators.CppAstarRoutingEvaluator`
 as its routability fitness signal (KiCad-2 / Issue #2720, epic
-spheresemi/sphere#7199).
+#7199 in a private repo).
 
 The :class:`~kicad_tools.router.evaluators.CppAstarRoutingEvaluator` accepts a
 ``RouterFactory`` callable: ``(positions, rotations) -> Autorouter``.  The

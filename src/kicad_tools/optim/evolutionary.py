@@ -155,7 +155,7 @@ class EvolutionaryConfig:
     # When True, the GA's routability term is computed by an injected
     # ``RoutingEvaluator`` (e.g. ``CppAstarRoutingEvaluator``) instead of the
     # average-pairwise-spacing proxy.  This is the *outer-loop* swap of the
-    # cascaded place-and-route architecture (epic spheresemi/sphere#7199).
+    # cascaded place-and-route architecture (epic #7199 in a private repo).
     #
     # The flag is intentionally **off by default** so existing production
     # placement runs are unchanged until the A/B benchmark validates it.

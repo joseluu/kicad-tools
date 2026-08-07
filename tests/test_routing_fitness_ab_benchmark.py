@@ -189,7 +189,7 @@ def test_ab_spacing_vs_routing_fitness(tmp_path):
 
     record = {
         "issue": 2720,
-        "epic": "spheresemi/sphere#7199",
+        "epic": "private-repo#7199",
         "board": str(pcb_path.relative_to(pcb_path.parent.parent.parent.parent)),
         "budget": {
             "generations": _BENCH_GENERATIONS,
