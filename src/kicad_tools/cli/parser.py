@@ -2222,6 +2222,16 @@ def _add_pcb_parser(subparsers) -> None:
         action="store_true",
         help="Remove nets with no pad references after net assignment",
     )
+    pcb_sync_netlist.add_argument(
+        "--transactional",
+        action="store_true",
+        help=(
+            "Snapshot the target file before syncing and roll it back "
+            "byte-identical on failure (exception, Ctrl-C, or sync errors); "
+            "the failed attempt is preserved as a <file>.failed-<timestamp> "
+            "sidecar"
+        ),
+    )
 
     # pcb zones
     pcb_zones = pcb_subparsers.add_parser("zones", help="List copper pour zones")
@@ -5082,6 +5092,17 @@ def _add_fix_drc_parser(subparsers) -> None:
         choices=["text", "json", "summary"],
         default="text",
         help="Output format (default: text)",
+    )
+    fix_drc_parser.add_argument(
+        "--transactional",
+        action="store_true",
+        help=(
+            "Snapshot the output file before repairing and roll it back "
+            "byte-identical if the run fails (exception, Ctrl-C, no-progress "
+            "exit 1, or connectivity-rollback exit 3); the failed attempt is "
+            "preserved as a <file>.failed-<timestamp> sidecar. Exit 2 "
+            "(partial repair) keeps the applied repairs."
+        ),
     )
 
 
