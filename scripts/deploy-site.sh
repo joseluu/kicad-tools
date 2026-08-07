@@ -46,8 +46,8 @@
 #
 # Cloudflare account guard (deploy path only):
 #   Before deploying, the script asserts the authenticated wrangler account ID
-#   matches EXPECTED_CLOUDFLARE_ACCOUNT_ID (defaults to the personal account
-#   251e6e8626d921603fdc3f0d75576bc6 / r.j.walters@gmail.com).  This prevents a
+#   matches the expected personal account, which is pinned below as a SHA-256
+#   digest rather than a literal ID.  This prevents a
 #   stray work account left logged in from receiving the deploy.  Override the
 #   expected ID via the EXPECTED_CLOUDFLARE_ACCOUNT_ID env var if needed.  The
 #   guard is skipped entirely under --no-deploy (build-only needs no wrangler).
@@ -69,12 +69,28 @@ usage() {
 }
 
 # --- Cloudflare account guard ----------------------------------------------
-# Expected Cloudflare account ID for kicad-tools deploys.  Defaults to the
-# personal account (r.j.walters@gmail.com / Personal Account); override via the
-# EXPECTED_CLOUDFLARE_ACCOUNT_ID env var.  A deploy recently landed on the WRONG
-# account (a stray work account left logged in), so the guard below refuses to
-# deploy unless the authenticated wrangler account matches.
-EXPECTED_CLOUDFLARE_ACCOUNT_ID="${EXPECTED_CLOUDFLARE_ACCOUNT_ID:-251e6e8626d921603fdc3f0d75576bc6}"
+# Expected Cloudflare account for kicad-tools deploys, pinned as a SHA-256
+# digest rather than a literal account ID: this is a public repo, and an
+# account identifier is a fact about our infrastructure that does not need
+# publishing.  The account ID is 128 bits of hex, so the digest does not
+# expose it to brute force.  A deploy recently landed on the WRONG account (a
+# stray work account left logged in), so the guard below refuses to deploy
+# unless the authenticated wrangler account matches.
+#
+# Override with EXPECTED_CLOUDFLARE_ACCOUNT_ID (compared literally) or
+# EXPECTED_CLOUDFLARE_ACCOUNT_ID_SHA256.
+EXPECTED_CLOUDFLARE_ACCOUNT_ID_SHA256="${EXPECTED_CLOUDFLARE_ACCOUNT_ID_SHA256:-04e8eb2a99d37a555c87220b1d4cd1c018afbe5b65360bdd2224eb8e9f6b69c2}"
+
+# sha256_of VALUE -- portable digest helper (sha256sum on Linux, shasum on macOS)
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
+  else
+    return 1
+  fi
+}
 
 # assert_cloudflare_account WRANGLER_CMD...
 #   Runs `wrangler whoami`, extracts the 32-hex account ID, and aborts (exit 1)
@@ -88,7 +104,7 @@ assert_cloudflare_account() {
     err "Could not run 'wrangler whoami' (not logged in?). Output:"
     printf '%s\n' "${whoami_out}" >&2
     err "Refusing to deploy. Run 'wrangler logout && wrangler login' to the"
-    err "correct account (r.j.walters@gmail.com), then re-run this script."
+    err "correct personal Cloudflare account, then re-run this script."
     exit 1
   fi
 
@@ -102,19 +118,33 @@ assert_cloudflare_account() {
     err "Are you logged in? Output was:"
     printf '%s\n' "${whoami_out}" >&2
     err "Refusing to deploy. Run 'wrangler logout && wrangler login' to the"
-    err "correct account (r.j.walters@gmail.com), then re-run this script."
+    err "correct personal Cloudflare account, then re-run this script."
     exit 1
   fi
 
-  if [ "${account_id}" != "${EXPECTED_CLOUDFLARE_ACCOUNT_ID}" ]; then
+  local account_sha
+  if ! account_sha="$(sha256_of "${account_id}")"; then
+    err "Neither sha256sum nor shasum found -- cannot verify the Cloudflare account."
+    err "Refusing to deploy rather than skipping the identity guard."
+    exit 1
+  fi
+
+  local matches="no"
+  if [ -n "${EXPECTED_CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+    [ "${account_id}" = "${EXPECTED_CLOUDFLARE_ACCOUNT_ID}" ] && matches="yes"
+  else
+    [ "${account_sha}" = "${EXPECTED_CLOUDFLARE_ACCOUNT_ID_SHA256}" ] && matches="yes"
+  fi
+
+  if [ "${matches}" != "yes" ]; then
     err "WRONG Cloudflare account! Refusing to deploy."
-    err "  authenticated account ID: ${account_id}"
-    err "  expected account ID:      ${EXPECTED_CLOUDFLARE_ACCOUNT_ID}"
+    err "  authenticated account sha256: ${account_sha:0:12}..."
+    err "  expected account sha256:      ${EXPECTED_CLOUDFLARE_ACCOUNT_ID_SHA256:0:12}..."
     err "Wrangler uses whatever account is globally logged in — a stray work"
     err "account would receive this deploy (or silently create a duplicate"
     err "project on the wrong account)."
     err "Fix: run 'wrangler logout && wrangler login' and authenticate to the"
-    err "correct account (r.j.walters@gmail.com / Personal Account), then"
+    err "correct personal Cloudflare account, then"
     err "re-run this script. To intentionally target a different account, set"
     err "EXPECTED_CLOUDFLARE_ACCOUNT_ID to its ID."
     exit 1
