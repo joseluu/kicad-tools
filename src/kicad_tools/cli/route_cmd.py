@@ -205,6 +205,15 @@ def _normalize_deterministic_budget(args, quiet: bool = False) -> None:
 
     No-op when ``--deterministic-budget`` is not set, so legacy behaviour is
     preserved bit-for-bit.
+
+    Issue #4730: the pinned caps in (2)/(2b) are what a DETERMINISTIC
+    relief-rescue sub-search bound would hand its probe / victim-re-land
+    searches to -- but that bound stays OPT-IN
+    (``DETERMINISTIC_RESCUE_DEFAULT`` is ``False``): board 07 regressed with it
+    on (changed LVS open set, routed-DRC 8 -> 13 against an allowlist main sits
+    exactly at), so ``--deterministic-budget`` still means "wall-clock rescue
+    bound" for every ``kct route`` caller.  No call site passes the flag; the
+    constant is the single switch to flip when that regression is understood.
     """
     if not getattr(args, "deterministic_budget", False):
         return
@@ -5789,6 +5798,17 @@ def route_with_layer_escalation(
                     max_iterations=getattr(args, "two_phase_iterations", None) or args.iterations,
                 )
             elif args.strategy == "negotiated":
+                # Issue #4730: ``deterministic_rescue`` is deliberately NOT
+                # passed here -- and neither is it on the escape / two-phase
+                # branches above.  Every one of those entry points defaults to
+                # ``DETERMINISTIC_RESCUE_DEFAULT`` (False), the documented
+                # board-07 negative result: with the deterministic bound in
+                # force board 07's copper-LVS open set changed and its
+                # routed-DRC went 8 -> 13 against an allowlist main sits
+                # exactly at.  So ``kct route`` keeps the historical wall clock
+                # on every path until that regression is understood.  All the
+                # call sites take the kwarg, so opting a board in is a one-line
+                # change here once its own A/B backs it.
                 router.route_all_negotiated(
                     max_iterations=args.iterations,
                     timeout=_attempt_timeout,
@@ -6774,6 +6794,17 @@ def route_with_rule_relaxation(
                     max_iterations=getattr(args, "two_phase_iterations", None) or args.iterations,
                 )
             elif args.strategy == "negotiated":
+                # Issue #4730: ``deterministic_rescue`` is deliberately NOT
+                # passed here -- and neither is it on the escape / two-phase
+                # branches above.  Every one of those entry points defaults to
+                # ``DETERMINISTIC_RESCUE_DEFAULT`` (False), the documented
+                # board-07 negative result: with the deterministic bound in
+                # force board 07's copper-LVS open set changed and its
+                # routed-DRC went 8 -> 13 against an allowlist main sits
+                # exactly at.  So ``kct route`` keeps the historical wall clock
+                # on every path until that regression is understood.  All the
+                # call sites take the kwarg, so opting a board in is a one-line
+                # change here once its own A/B backs it.
                 router.route_all_negotiated(
                     max_iterations=args.iterations,
                     timeout=_attempt_timeout,

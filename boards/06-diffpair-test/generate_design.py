@@ -2782,6 +2782,13 @@ def route_pcb(input_path: Path, output_path: Path) -> bool:
         # to that point.  Bounding those sub-searches by the per-net
         # node-expansion cap instead makes the commit/rollback decision
         # machine-independent -- the point of this issue.
+        #
+        # #4730 proposed making ``deterministic_rescue=True`` the fleet
+        # default and WITHDREW the flip on a measured board-07 regression
+        # (``DETERMINISTIC_RESCUE_DEFAULT`` is ``False``), so the explicit
+        # kwarg below is the only thing switching the deterministic bound on
+        # for this board.  Do not drop it on the assumption that a default
+        # covers it.
         return router.route_all_negotiated(
             per_net_timeout=None,
             timeout=None,

@@ -34,7 +34,12 @@ sources:
    natural time on GitHub runners -- the same commit landed 21/21 and
    20/21 on different runners from line-identical logs.  Fixed with
    ``route_all_negotiated(deterministic_rescue=True)``, which bounds the
-   sub-searches by the deterministic per-net node-expansion cap.
+   sub-searches by the deterministic per-net node-expansion cap.  Board 06
+   opted in first (#4536) and still opts in explicitly: #4730 proposed
+   making it the fleet default and withdrew the flip on a measured
+   board-07 regression, so ``DETERMINISTIC_RESCUE_DEFAULT`` is ``False``
+   and the kwarg in ``generate_design.py`` is the only thing switching the
+   bound on for this board.
 
 3. **Residual -- UUID-sorted file order.** With the wall clock removed,
    runs produced byte-identical logs and identical copper *multisets*,

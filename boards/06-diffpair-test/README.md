@@ -163,10 +163,14 @@ bisection localized **three** sources:
    8--12 s natural time on GitHub runners, so the same commit produced
    21/21 on one runner and 20/21 on another from routing logs that are
    line-identical up to the rescue.  Fixed with
-   `route_all_negotiated(deterministic_rescue=True)` (default off
-   elsewhere), which bounds the rescue's probe / re-land sub-searches by
-   the deterministic per-net node-expansion cap instead.  This flag is
-   **load-bearing for `REQUIRED_SIGNAL_REACH = 21`** in
+   `route_all_negotiated(deterministic_rescue=True)`, which bounds the
+   rescue's probe / re-land sub-searches by the deterministic per-net
+   node-expansion cap instead.  This board opted in first (#4536) and
+   remains an explicit opt-in: #4730 proposed making it the fleet default
+   and withdrew the flip on a measured board-07 regression, so
+   `DETERMINISTIC_RESCUE_DEFAULT` is `False` on every entry point.  The
+   `True` here is therefore not documentary — it is **load-bearing for
+   `REQUIRED_SIGNAL_REACH = 21`** in
    `scripts/ci/check_diffpair_coverage.py`.
 
 3. **Residual: UUID-sorted file order.**  With the wall clock removed,
