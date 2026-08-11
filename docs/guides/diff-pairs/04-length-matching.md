@@ -56,10 +56,11 @@ tracker = router.update_diffpair_skew(
 # tracker exposes (L_p, L_n) and skew per pair
 ```
 
-`update_diffpair_skew` is at `src/kicad_tools/router/core.py:6926`. The
-tracker (`DiffPairLengthTracker`) measures skew unconditionally per pair —
-no per-class gate. The `skew_tolerance_mm` field only governs whether the
-DRC rule fires (guide 06).
+`Autorouter.update_diffpair_skew` is defined in
+`src/kicad_tools/router/core.py`. The tracker (`DiffPairLengthTracker` in
+`src/kicad_tools/router/diffpair_length.py`) measures skew
+unconditionally per pair — no per-class gate. The `skew_tolerance_mm`
+field only governs whether the DRC rule fires (guide 06).
 
 ## When serpentine inserts
 
