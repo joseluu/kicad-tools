@@ -858,10 +858,17 @@ class PairwisePathChecker:
     each route before mutating it and re-marks it after, so a snapshot taken at
     construction time would go stale mid-pass.
 
-    Instances only exist when a voltage map is active --
-    :meth:`from_router` returns ``None`` otherwise (the dormancy contract every
-    pairwise consumer follows), so callers guard with a single ``is None``
-    check and the scalar-only path stays byte-identical.
+    Instances only exist when a voltage map is active *and* the table it
+    installed actually widens some pair -- :meth:`from_router` returns ``None``
+    otherwise (the dormancy contract every pairwise consumer follows), so
+    callers guard with a single ``is None`` check and the scalar-only path
+    stays byte-identical.
+
+    This is the one resolver for router-derived pairwise context: the #4766
+    copper-moving post-passes build their route-level gates from these same
+    four fields (:attr:`table`, :attr:`id_to_name`, :attr:`attach_zones` and
+    :meth:`foreign_routes`), so no pass can drift into a different verdict
+    from the path-level predicate or from the #4588 audit.
     """
 
     table: PairwiseClearanceTable
@@ -884,16 +891,21 @@ class PairwisePathChecker:
         ``add_component``), and the #4506 zones from the CLI resolver's
         memoised ``_pairwise_attach_zones_cache`` hand-off (#4602 precedent).
 
-        Returns ``None`` when no voltage map installed a table (or the router
-        has no grid) -- the caller's signal to skip pairwise consultation
-        entirely.
+        Returns ``None`` when no voltage map installed a table, **or** when the
+        installed table widens nothing (``required_by_pair`` empty) -- either
+        way the caller's signal to skip pairwise consultation entirely.  A
+        table that asks for no widening can only ever answer "clear", so
+        arming a scan for it would be pure cost (#4766).
+
+        A router **without a grid** still yields a checker: ``foreign_routes``
+        then falls back to ``router.routes``.  The copper-moving post-passes
+        (#4766) are driven in unit tests by stub routers that carry routes but
+        no grid, and the pathfinder-facing consumers pass a real router where
+        the two are the same live list anyway.
         """
         rules = getattr(router, "rules", None)
         table = getattr(rules, "pairwise_clearance", None) if rules is not None else None
-        if table is None:
-            return None
-        grid = getattr(router, "grid", None)
-        if grid is None:
+        if table is None or not getattr(table, "required_by_pair", None):
             return None
 
         id_to_name: dict[int, str] = {
@@ -903,13 +915,17 @@ class PairwisePathChecker:
         }
         name_to_id_fn = getattr(router, "_net_name_to_id", None)
         if callable(name_to_id_fn):
-            for name, net_id in name_to_id_fn().items():
+            # Sorted so a name collision on one id resolves deterministically
+            # (#4766): an unsorted walk lets dict order pick the winner.
+            for name, net_id in sorted(name_to_id_fn().items()):
                 id_to_name.setdefault(int(net_id), name)
 
         zones = getattr(router, "_pairwise_attach_zones_cache", None) or ()
+        grid = getattr(router, "grid", None)
+        source: object = router if grid is None else grid
         return cls(
             table=table,
-            foreign_routes=lambda: grid.routes,
+            foreign_routes=lambda: getattr(source, "routes", None) or (),
             id_to_name=id_to_name or None,
             attach_zones=tuple(zones),
         )
@@ -1008,6 +1024,35 @@ def find_pairwise_violations(
                     if violation is not None:
                         out.append(violation)
     return out
+
+
+def normalize_net_key(name: str) -> str:
+    """Public form of the pairwise net-name normaliser (#4766).
+
+    Consumers outside this module (the DRC nudge's revert gate) need to key
+    routes the same way :func:`violation_pair_key` keys violations; exporting
+    the normaliser keeps them from reaching across a module boundary for the
+    private :func:`_norm_net_key`.
+    """
+    return _norm_net_key(name)
+
+
+def violation_pair_key(violation: PairwiseViolation) -> tuple[str, str]:
+    """Order-independent, ``/``-stripped net-pair key of a violation (#4766)."""
+    a = _norm_net_key(violation.net_a)
+    b = _norm_net_key(violation.net_b)
+    return (a, b) if a <= b else (b, a)
+
+
+def violation_pair_keys(violations: Iterable[PairwiseViolation]) -> set[tuple[str, str]]:
+    """Set of :func:`violation_pair_key` values for a violation list (#4766).
+
+    The post-pass gates compare a before/after scan by *net pair*, not by
+    coordinate: a pre-existing (inherited) shortfall that merely moves must not
+    be mistaken for one the pass introduced, or the pass would start
+    "repairing" copper the #4588 audit is supposed to keep reporting.
+    """
+    return {violation_pair_key(v) for v in violations}
 
 
 def _resolve_net_name(id_to_name: Mapping[int, str] | None, net_id: int, fallback: str) -> str:
