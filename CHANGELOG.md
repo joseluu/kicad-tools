@@ -625,6 +625,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Multi-pin nets are no longer skipped outright on `--deterministic-budget`
+  placement-feedback re-routes** (#4776) — `--deterministic-budget` sets
+  `args.per_net_timeout = 0.0` as its "wall-clock cutoff disabled" sentinel, and
+  ~24 `route_all_negotiated` call sites in `route_cmd.py` normalize it away with
+  `or None`. The two placement-feedback helpers (`_run_placement_feedback`,
+  `_run_placement_delta_feedback`) did not, so the literal `0.0` reached the
+  whole `route_all_negotiated` call — and `0.0` is **not** falsy-safe on the way
+  down. `derive_iter_per_net_cap(0.0, remaining)` collapsed to `min(0.0, cap)` =
+  `0.0` at every rip-up-loop reroute site, and `route_net_negotiated`'s
+  cumulative net deadline (`… if per_net_timeout is not None else None`) became
+  an already-expired deadline, short-circuiting **every RSMT edge of every
+  ≥3-pad net before a single A\* call**. So on a placement-feedback re-route
+  only 2-pin nets routed (those survive because the C++ backend reads `0.0` as
+  "no deadline"); every multi-pin net was dropped as a timeout failure. The same
+  `0.0` also reached `Autorouter._post_negotiation_sweep_bounds`, which took
+  `min(0.0, 10 s)` and made the #4159 rescue sweep a silent no-op on those
+  passes. Both call sites now normalize, and the sweep-bounds consumer
+  additionally treats a falsy per-net budget as absent (mirroring
+  `_relief_subsearch_budget`, where `0.0` has always been falsy) so no future
+  caller can poison it; the `is None` gate on the safety-backstop arm is
+  deliberately unchanged, so no board changes which arm it selects. Because this
+  restores routing decisions that determine routed *reach*, it was
+  gated on a back-to-back host A/B against `origin/main` @ `fe662585` (C++
+  backend build 19, `PYTHONHASHSEED=42`, `--seed 42`): board 07 keeps 26/31
+  reach, the same 5-net open set (`DQ3, DQ4, MIPI_DAT0_N, TMDS_D0_N,
+  TMDS_D1_N`), 8 blocking DRC against its floor of 8 with an identical rule
+  split (`diffpair_length_skew` 4 + `diffpair_routing_continuity` 4) and
+  **byte-identical routed copper** (both placement-delta probes were refused in
+  both arms, so the final board is the initial pass's either way — an accept-gate
+  outcome, not an invariant); board 04 routes 9/9 and never reaches the
+  path at all (0 blocking DRC on the strict-0 gate, 0 unconnected pads, LVS
+  clean, identical copper). No allowlist or gate threshold was touched. The
+  measurement is recorded in
+  `boards/07-matchgroup-test/diagnostic-runs/README.md`.
+
 - **The pure-Python fallback A* is now pairwise (HV-isolation) aware at search time** (#4507, epic #4431 Phase 2) — the hot-loop bitmap, `_is_trace_blocked`/`_is_via_blocked` kernels and the C++ backend's fallback-router threading now mirror the C++ `cross_domain_*` search kernels (same domain projection, per-pair widened radius, layer-scoped #4506 attach-zone waiver, out-of-bounds-is-empty ring dilation), so a net that falls back on an HV board converges instead of thrashing against the Phase-1 post-route gate; fully dormant without `--voltage-map`.
 
 - **`kct ipc push-routes` can now actually read a board** (#4788) — the
