@@ -47,6 +47,7 @@ Point-in-time working documents — dated entries describe the tree as of their 
 
 | Document | Description |
 |----------|-------------|
+| [HV Pairwise Proof: softstart rev-C (2026-08)](hv-pairwise-softstart-proof.md) | #4507 T4 manual proof run on the local-only mains HV fixture |
 | [Placement Pad-Anchoring Audit (2026-08)](placement-pad-anchoring-audit.md) | Centre- vs pad-anchored placement objective terms (#4831) |
 | [OmniLayout / OmniRouting Recon (2026-08)](research/omnilayout-recon.md) | External LLM layout/routing benchmark (#4830); verdict: adapt the metric protocol, drop the data (no licence) |
 | [Board Fleet Parity Audit (2026-06)](board-fleet-parity-audit-2026-06.md) | Fleet-wide board status snapshot |
