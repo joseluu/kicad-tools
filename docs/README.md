@@ -42,6 +42,17 @@ Detailed reference documentation:
 ### For Contributors
 - [Development Guide](contributing/development.md) - Setup, testing, code style
 
+### Research Notes & Audits
+Point-in-time working documents — dated entries describe the tree as of their date:
+
+| Document | Description |
+|----------|-------------|
+| [Placement Pad-Anchoring Audit (2026-08)](placement-pad-anchoring-audit.md) | Centre- vs pad-anchored placement objective terms (#4831) |
+| [Board Fleet Parity Audit (2026-06)](board-fleet-parity-audit-2026-06.md) | Fleet-wide board status snapshot |
+| [Install Pilot: chorus](install-pilot-chorus.md) | Consumer-repo install pilot for Epic #4054 acceptance |
+| [Atopile Build System Research](research-atopile-build-system.md) | Survey of Atopile's build DAG and targets |
+| [Placement Optimizer Agent Prompt](PLACEMENT-OPTIMIZER-AGENT-PROMPT.md) | Continuation prompt for the physics-based placement optimizer |
+
 ---
 
 ## Module Overview

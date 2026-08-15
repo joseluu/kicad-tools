@@ -8,6 +8,13 @@
 # Build artifacts
 # Compiled native extension (rebuilt locally via `uv run kct build-native`)
 *.so
+# CMake tree left at repo root by scripts/build-cpp.sh (`kct build-native`)
+/build/
+# sdist/wheel output from `uv build` (RELEASING.md)
+/dist/
+
+# macOS Finder droppings
+.DS_Store
 
 # Python
 __pycache__/
@@ -36,6 +43,10 @@ boards/*/*/output/renders/
 # Board metrics (generated at runtime by `kct board-metrics`, Epic #3674)
 boards/*/output/board.json
 boards/*/*/output/board.json
+
+# Board-generation log (removed by `make clean`, never committed)
+boards/*/design_output.log
+boards/*/*/design_output.log
 
 # Silkscreen marking sidecars (written by `kct build`'s silkscreen step)
 # NOTE: this is marking-identity state, not a cache -- the uuid->tag map

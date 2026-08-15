@@ -2,7 +2,7 @@
 
 Prioritized roadmap generated from current GitHub label state. Maintained by the Guide triage agent.
 
-*Last updated: 2026-06-17*
+*Last updated: 2026-08-14*
 
 ---
 
@@ -12,11 +12,31 @@ Prioritized roadmap generated from current GitHub label state. Maintained by the
 
 ## In Progress (`loom:building`)
 
-*Nothing in flight.* 0 open PRs.
+*Nothing in flight.* 2 open PRs, both stale Dependabot site bumps (#4835 nanoid, #4836 js-yaml) already satisfied on `main` via the astro 7 upgrade — left for Dependabot auto-close.
 
 ## Ready for Work (`loom:issue`)
 
-*Empty.* No approved issues are currently queued for Builders.
+| Issue | Title |
+|-------|-------|
+| #4507 | Router Phase 2 (epic #4431): search-time pairwise HV avoidance + C++ `validate_route` domain-matrix extension |
+| #4674 | CLI: `--format json` for the remaining prose-only `kct` subcommands (build/pipeline/stitch left) |
+| #4799 | Router/planner: pre-route capacity/solvability predictor from the crossover census |
+| #4830 | External corpus + benchmark: open-schematics (87k designs) and OmniLayout (slices 2–4) |
+| #4831 | pcbplace generative-placement ideas: pad-anchored constraints, local repair, deterministic legaliser (M-stubs) |
+
+## Awaiting Triage
+
+#4848 (C++ pairwise first-band-vs-nearest pricing quirk), #4855 (`kct mcp --transport http` passes host/port `FastMCP.run()` doesn't accept).
+
+## Active Epics (need Architect decomposition)
+
+| Epic | Title |
+|------|-------|
+| #4431 | Class-pair (net-class × net-class) clearance rules in the router (parent of #4507) |
+| #4409 | Coupled diff-pair router must actually couple pairs (board-06: 0/9) |
+| #4410 | board-05 unattended manufacturable BLDC generation |
+| #3803 | Router/DRC fidelity: kct PASS vs native KiCad DRC violations |
+| #3438 | board-07 parallel pad-array bundles (router ↔ placement) |
 
 ## LVS Soundness Epic — COMPLETE (2026-06-17)
 
@@ -28,16 +48,9 @@ The independent copper-LVS soundness epic (motivated by #3742) is shipped. A `/l
 
 Net result: boards 00/01/02/03 are copper-LVS clean and reproducible; the gate caught (and fixed) genuine shorts on boards 02/03/04 that passed DRC.
 
-## Remaining — Human-led design decisions (`loom:architect` / `loom:blocked`)
+## Resolved since the 2026-06-17 refresh
 
-| Issue | Title | Status |
-|-------|-------|--------|
-| **#3775** | board-05 U3-south relayout to free PHASE_A/B/C escape channels | **Research-grade.** Curator (2026-06-17) confirmed not safely automatable in one builder pass: U3 south edge packs 20 nets across 9.5mm @ 0.5mm pitch, zero slack, all prior widening levers spent. Needs a human to pick a relayout strategy (inner-layer PHASE corridors / ISENSE-return relocation / J2 re-clustering) — full analysis posted on the issue. Stays `loom:architect`. |
-| **#3766** | board-05: complete the 7 blocking unrouted nets | **Blocked** behind #3775 (the relayout is the prerequisite). |
-
-## Tracked follow-ups (advisory / low-priority)
-
-`loom:architect`: none currently beyond #3775. (Board-03/04 LVS hard-gate *graduation* is the deferred Part 2 of #3780, gated on the board defects now fixed — a tight follow-up.)
+The board-05 blockers listed here previously are done: **#3766 closed 2026-07-08** — 206/206 pads, ship-ready, all 4 ISENSE Kelvin nets routed (#3997/#3998), manufacturing bundle regenerated at jlcpcb-tier1 (#3999). The #3775 relayout question was superseded by the placement-rework + hand-router-toolkit path. Remaining board-05 work is the *unattended-generation* epic #4410 above (generic-library capability, not a board fix).
 
 ## Recently Completed
 
@@ -51,7 +64,9 @@ The May 1–8 sprint cleared an enormous backlog of router-pipeline polish, boar
 | **v0.14.0 release** | Demo gallery website (kicad-tools.org), zone-fill foreign-pad clearance fix, PCB `page_fit`, oblique 3D + 2D-SVG renders, `kct render` / `board-metrics` / `pcb page-fit` commands, gallery LVS status, ERC/LVS/Manifest meta sub-checks for `kct check` (2026-06-16) |
 | **v0.15.0 release** | Router feasibility certificates + constructive escape ordering, coupled diff-pair corridor attractors + C++ joint-state A\* port, slack-budget corridor widening, copper-LVS gates across boards 01–07, LCSC/EasyEDA + cross-library 3D model resolver tiers, thin-copper/silk-clearance/net-0-bridge DRC rules, gallery-hardened board fixtures 00–07 (2026-07-13) |
 | **v0.16.0 release** | Region-bounded routing (`--region` + boundary stub reconnection), ampacity-aware net-class min-width + DRC (IPC-2221), copper dedupe (`pcb dedupe` + emission-time), `pcb reinforce` anchor-PTH rows, `pcb padmap` / `sch fix-annotation` / `pcb strip --region`, `net-status --strict` real-geometry connectivity, off-board preflight; pre-tag fleet validation fixed #4226 (junction-dot-gated wire union), #4227 (courtyard bbox-fallback annotation), #4229 (zone-pour plane-pad connectivity) (2026-07-15) |
-| **v0.18.0 release (current)** | HV / analog manufacturing gates — **`kct creepage`** (surface-path creepage audit vs IEC 60664-1/62368-1, #4327/#4332/#4333/#4334/#4338/#4341) and **`kct analyze current-sense`** (analog layout lint: parallel-run + sense-loop area + Kelvin-tap, #4328/#4331/#4335/#4337). Plus real `--nets` route filter (#4325), `pcb reinforce` multi-branch anchoring (#4323), `route --layers auto` inner-layer advisory (#4315), and safety-relevant `kct check` ampacity/stackup false-PASS fixes (#4324/#4326/#4339). IEC values verified against a controlled copy of the standard (#4343). Both new capabilities shipped as phased MVPs (1→3) with tracked follow-ups. (2026-07-20) |
+| **v0.19.0 release** | HV-isolation design loop (`kct creepage --voltage-map`, `zones hv-keepout`, HV-aware placement, `/kct:hv-isolation-loop` skill) + via-in-pad manufacturability (`kct fix-vias` off-pad relocation), `analyze electrical-rating`, `--emit-dru`/`--emit-drc-constraints` rule-identity sidecars (2026-07-20) |
+| **v0.20.0 release (current)** | `kct route --complete` completion pass, route-time HV-isolation enforcement in every engine, `.kct_waivers.json` waiver mechanism, `net-status` strict-by-default, KiCad-10 net-dialect / export-manifest / LVS-identity correctness sweep; shipped as a 13-PR train through the Actions outage (2026-08-06) |
+| **v0.18.0 release** | HV / analog manufacturing gates — **`kct creepage`** (surface-path creepage audit vs IEC 60664-1/62368-1, #4327/#4332/#4333/#4334/#4338/#4341) and **`kct analyze current-sense`** (analog layout lint: parallel-run + sense-loop area + Kelvin-tap, #4328/#4331/#4335/#4337). Plus real `--nets` route filter (#4325), `pcb reinforce` multi-branch anchoring (#4323), `route --layers auto` inner-layer advisory (#4315), and safety-relevant `kct check` ampacity/stackup false-PASS fixes (#4324/#4326/#4339). IEC values verified against a controlled copy of the standard (#4343). Both new capabilities shipped as phased MVPs (1→3) with tracked follow-ups. (2026-07-20) |
 | **v0.17.0 release** | Experimental alternative routing substrate — adaptive octilinear **lattice** engine (`--route-engine lattice`) + constrained-Delaunay **navmesh/mesh** engine (`--route-engine mesh`), both default-OFF (epic #4267, P0→P4); routes large mixed-pitch boards the grid can't fit in memory (softstart rev-C: 74/77 nets DRC-clean at ~3% grid memory). Plus `--max-cells` (#4249), analytical `route --dry-run` (#4266), settable schematic `in_bom`/`dnp` (#4303), `net-status --why` ranked fix recommender (#4261/#4286), parts-catalog fixes (#4295–#4299); board-07 Track A closed placement-bound (#4256–#4258). `--route-engine grid` default byte-identical to 0.16.0 (2026-07-17) |
 | **C++ pathfinder hardening** | `cpp_backend` with stale-`.so` build-version guard (#2501), DRC violation cost feedback (#2442), pre-computed blocked bitmap (#2437), pad metal area expansion (#2434), resumable A* (#2449) |
 | **Auto-pour zones** | Power-net pour zones generated automatically with proper edge-clearance inset and per-net priority (#2407, #2417, #2422, #2461, #2519) |
@@ -65,12 +80,12 @@ The May 1–8 sprint cleared an enormous backlog of router-pipeline polish, boar
 
 | Metric | Value |
 |--------|-------|
-| Total open issues | 0 |
-| Ready for work (`loom:issue`) | 0 |
+| Total open issues | 12 |
+| Ready for work (`loom:issue`) | 5 |
 | Urgent (`loom:urgent`) | 0 |
 | Building (`loom:building`) | 0 |
 | Blocked (`loom:blocked`) | 0 |
-| Proposals pending approval (`loom:architect`) | 0 (Architect pass in flight to repopulate) |
-| Active epics | 0 |
+| Awaiting triage (`loom:triage`) | 2 |
+| Active epics (`loom:epic`) | 5 |
 
-**Assessment:** The backlog is **empty** as of 2026-06-16 — both open issues and open PRs are at zero. Epic #2556 (differential-pair first-class support, Phases 1A–1D) has fully merged, and v0.14.0 shipped to PyPI (demo gallery, renders, board-metrics, and the first independent copper-LVS soundness gate). With the queue clear, an Architect pass was launched to generate the next wave of work, prioritizing: (1) finishing the LVS soundness story (#3742 follow-ups — robust zone-pour extraction and copper-LVS as a first-class manufacturability leg), (2) re-scoping board-parity (#2394) after the recent board 00/04/05/06 DRC/LVS burst, and (3) other high-value epics. Re-run the Guide once those proposals are filed and approved.
+**Assessment:** Healthy as of 2026-08-14, immediately after the session-9 sweep (41 PRs merged, 8 issues closed — the dependency-modernization batch plus 12 builds; see `.loom/SWEEP-HANDOFF.md` and WORK_LOG). The queue holds five curated, sliceable work streams (HV routing #4507, machine-output sweep #4674, capacity predictor #4799, corpus exploration #4830, placement ideas #4831) and five epics awaiting serialized Architect decomposition (#4431, #4409, #4410, #3803, #3438). Two fresh triage items (#4848, #4855) need a Curator pass.
