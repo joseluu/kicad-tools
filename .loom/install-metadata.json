@@ -1,8 +1,7 @@
 {
-  "loom_version": "0.18.122",
-  "loom_commit": "149228ae",
+  "loom_version": "0.18.123",
+  "loom_commit": "4dd23e7a",
   "install_date": "2026-08-10",
-  "loom_source": "/private/tmp/claude-501/-Users-rwalters-GitHub-kicad-tools/197539f9-2f98-43d1-ac52-520b8cbae4e0/scratchpad/loom-v0.18.0",
   "installed_files": [
     ".claude/agents/loom-architect.md",
     ".claude/agents/loom-auditor.md",
