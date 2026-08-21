@@ -28,6 +28,16 @@ Full policy: `.loom/docs/gh-cached.md`.
 
 ---
 
+## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
+
+If you post a comment via `gh issue comment` / `gh pr comment` / `gh api ...
+comments` from a scratch file, `--body @path` (and `gh api -f body=@path`)
+posts the literal string `@path`, not the file's contents. **Full pitfall,
+incident citation, and fixes**:
+[`comment-body-literal-path.md`](comment-body-literal-path.md).
+
+---
+
 ## Detailed Code Smell Examples
 
 Look for these patterns that often indicate bloat:
@@ -132,26 +142,21 @@ When two or more classes/modules solve the same domain problem with different na
 class SessionManager:
     def create_session(self, user_id: str) -> Session:
         return Session(user_id=user_id, token=generate_token())
-
     def destroy_session(self, session_id: str) -> None:
         self._store.delete(session_id)
-
 
 # file: src/core/session_handler.py
 class SessionHandler:
     def new_session(self, uid: str) -> dict:
         return {"uid": uid, "tok": make_token(), "ts": time.time()}
-
     def end_session(self, sid: str) -> bool:
         return self._db.remove(sid)
-
 
 # GOOD: Single canonical implementation
 # file: src/sessions/session_manager.py
 class SessionManager:
     def create_session(self, user_id: str) -> Session:
         return Session(user_id=user_id, token=generate_token())
-
     def destroy_session(self, session_id: str) -> None:
         self._store.delete(session_id)
 ```
@@ -231,14 +236,12 @@ class ChangeDetector:
         """
         return True  # <-- validation never actually runs
 
-
 # GOOD (preferred): Finish the feature — check if dependencies now exist
 class ChangeDetector:
     def _is_component_modified(self, component: Component, baseline: Snapshot) -> bool:
         current_hash = component.content_hash()
         baseline_hash = baseline.get_hash(component.id)
         return current_hash != baseline_hash
-
 
 # GOOD (alternative): Remove if the feature is clearly abandoned
 ```
@@ -299,14 +302,13 @@ class PCBValidator:
     def _build_context(self, design_file: str) -> dict:
         # TODO: Implement actual PCB parsing
         return {
-            "layers": {},  # empty
-            "components": [],  # empty
-            "nets": [],  # empty
-            "rules": {},  # empty
+            "layers": {},        # empty
+            "components": [],    # empty
+            "nets": [],          # empty
+            "rules": {}          # empty
         }
         # _check_design_rules and _check_manufacturing_constraints
         # iterate over empty collections -- validation always passes
-
 
 # GOOD: Either implement or mark as not-yet-functional
 class PCBValidator:
@@ -379,19 +381,15 @@ class PatternAdapter:
     def adapt(self, patterns: list[str]) -> list[re.Pattern]:
         return [re.compile(self.convert_glob_to_regex(p)) for p in patterns]
 
-
 # GOOD: Module-level functions
 def convert_glob_to_regex(pattern: str) -> str:
     return fnmatch.translate(pattern)
 
-
 def match(text: str, pattern: str) -> bool:
     return fnmatch.fnmatch(text, pattern)
 
-
 def adapt_patterns(patterns: list[str]) -> list[re.Pattern]:
     return [re.compile(convert_glob_to_regex(p)) for p in patterns]
-
 
 # NOT a stateless ceremony: Dispatch-table class (uses self for method dispatch)
 class CommandRouter:
@@ -420,7 +418,6 @@ class CommandRouter:
 
     def handle_list(self, args: dict) -> Result:
         return Result(data=list_records(args.get("filter")))
-
     # This class has no self.x = assignments but DOES use self.method()
     # for internal dispatch. Converting to module functions would lose
     # the dispatch-table organization. Do NOT flag this.

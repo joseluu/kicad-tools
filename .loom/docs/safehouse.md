@@ -68,8 +68,68 @@ Env overrides (each wins over config for that key):
 | `LOOM_SAFEHOUSE_ROOMS_BY_REPO` | `rooms.byRepo`, as `repo=room[,repo=room…]` (#4225) |
 | `LOOM_SAFEHOUSE_ROOM_CLAIMS` | `rooms.claims` — dedicated peer-claim coordination room (#4713) |
 
-**Socket resolution**: configured `socket` → `$LOOM_SAFEHOUSE_SOCKET` →
-`$SAFEHOUSED_SOCKET`. If none resolves, narration logs one `warn!` and stays off.
+**Socket resolution** (precedence **env > config**, `resolve_socket` in
+`loom-daemon/src/safehouse.rs`; the bash-side worker-injection path
+(`defaults/scripts/lib/mcp-config.sh`'s `loom_mcp_safehouse_socket()`) mirrors
+the same chain): `$LOOM_SAFEHOUSE_SOCKET` → `$SAFEHOUSED_SOCKET` (the
+unprefixed convention `safehoused` clients also read) → the configured
+`socket` value. If none resolves, narration logs one `warn!` and stays off — no
+built-in `$HOME`-relative default, since safehouse is opt-in per-host.
+
+**`socket` must never be committed to the shared `.loom/config.json`** — like
+`observability.ingestKeyFile` (`observability.md`), it is host-specific by
+definition (every host's `safehoused` binds a different, unshareable path). Leave
+it unset in the committed file and either install `safehoused` at the
+conventional path each host's `$SAFEHOUSED_SOCKET` already points at, or set a
+per-host override in the gitignored `.loom-local/local.json` tier
+(`config_resolver.rs`, highest precedence) or via `$LOOM_SAFEHOUSE_SOCKET` —
+never in the committed file. #5457 is exactly the failure mode this avoids: a
+macOS `safehouse.socket` path was committed to this repo's own shared
+`.loom/config.json`, and — because `resolve_socket` checked the configured
+value *before* env at the time — every other host that `git pull`ed `main`
+inherited a path to a socket that did not exist on it, with no env override able
+to take effect while that stale path stayed committed.
+
+**Why there is still no built-in default, even after #5523.** #5457's fix left
+a gap: with the committed default gone and nothing installed in its place, an
+affected host's `safehouse.enabled: true` silently resolved to no socket at
+all, and the only signal was a `log_warn` inside each sweep's own per-role log
+— nobody was tailing those, so a real host ran with **zero** safehouse
+narration for 11 hours before a human noticed the public fleet
+pulse had gone stale (#5523). The tempting fix — teach the resolver a
+conventional-path fallback (e.g. `~/.loom/safehoused/state/safehoused.sock`) —
+was deliberately **rejected** for #5523: a code-level default *would* avoid
+re-triggering #5457's exact mechanism (it can't go stale via `git pull` the
+way a committed value can), but it would reintroduce the same underlying risk
+in a different shape — "resolves to *something*" would quietly stop meaning
+"actually reaches a live `safehoused`", which is precisely the gap that let
+#5523 run unnoticed. #5523's fix instead makes the **absence** loud and cheap
+to detect, in two ways, without touching this resolution chain at all:
+
+- `spawn-claude.sh`'s warning, when `safehouse.enabled` is true and no socket
+  resolves, now names the consequence ("no safehouse narration will be
+  recorded... the public fleet pulse is fed exclusively from
+  safehouse narration") instead of only the mechanism ("skipping safehouse MCP
+  injection") — still a `log_warn`, never a failed spawn (the degradation
+  contract above is unchanged: `safehouse.enabled: false`/absent stays a
+  byte-for-byte no-op, and `enabled: true` never blocks a sweep).
+- **`defaults/scripts/check-safehouse-socket.sh`** (installed as
+  `.loom/scripts/check-safehouse-socket.sh`) is a new standalone, on-demand
+  check that reports — per managed repo, without reading a single sweep log —
+  whether `safehouse.enabled` is set and, if so, whether a socket resolves AND
+  is present on disk. With no arguments it walks this host's machine-level
+  workspace registry (`~/.loom/workspaces.json`, the same registry
+  `loom-daemon workspace add/list` manages) and checks every registered repo
+  in one pass; pass explicit repo roots to check a subset. `--json` emits a
+  parseable array (`{repo, enabled, socket, present, status}` per repo) for
+  scripting/cron. It exits `0` when every repo is either not configured or
+  resolved-and-present, and `1` the moment any repo is enabled with an
+  unreachable socket — the exact condition #5523 needed surfaced. Unlike the
+  pre-existing static `Safehouse:` line in `loom-daemon-start.sh`'s startup
+  banner (below), this check has **no dependency on the daemon
+  (re)starting** — it can be run any time, which is what the incident
+  actually needed: the affected daemon never restarted across the 11-hour
+  window, so its own start-time check never re-ran.
 
 ### Room routing by attention class (`safehouse.rooms`, #4225)
 
@@ -99,10 +159,10 @@ class first, repo second**:
 
 | Tier | Room | Carries | Volume / notifications |
 |---|---|---|---|
-| 1 | `rooms.signal` (`loom-fleet`) | operator ↔ fleet conversation, every `handoff`, terminal `ack` / `completion`, future wave digests (#4217) | low, notifications **on**, cross-repo by design |
+| 1 | `rooms.signal` (`loom-fleet`) | operator ↔ fleet conversation, every `handoff`, terminal `ack` / `completion`, wave-dispatch `digest` roots (#4217) | low, notifications **on**, cross-repo by design |
 | 2 | `rooms.byRepo[<repo>]` (`fleet-<repo>`) | `task` (dispatch + phase transitions) and `chat` (worker chatter) | high, **muted** by default, opened while actively watching a repo |
 
-A Matrix **Space** ("2AM Fleet") grouping these rooms is tracked separately in the
+A Matrix **Space** (e.g. "Fleet") grouping these rooms is tracked separately in the
 safehouse repo — Loom creates no Space.
 
 **Routing rules**
@@ -112,13 +172,13 @@ safehouse repo — Loom creates no Space.
 - The kind → tier table is the whole routing decision:
   | Envelope `type` | Room |
   |---|---|
-  | `handoff`, `ack`, `completion` | signal |
+  | `handoff`, `ack`, `completion`, `digest` | signal |
   | `task`, `chat` | repo firehose |
   It is written as a **compile-time-exhaustive `match`** over an `EnvelopeKind`
-  enum (`safehouse.rs`), with no wildcard arm, so a future sixth envelope type
-  fails to compile (and a type added to only one of `KNOWN_TYPES` /
-  `EnvelopeKind` fails a test) rather than silently defaulting into the wrong
-  room.
+  enum (`safehouse.rs`), with no wildcard arm, so a future member fails to
+  compile (and a type added to only one of `KNOWN_TYPES` / `EnvelopeKind` fails
+  a test) rather than silently defaulting into the wrong room. `digest` (#4217)
+  is the newest member.
 - **Rooms are per-repo, not per-host.** Host attribution already rides the Matrix
   sender (per-host bot accounts), so a second host working the same repo posts
   into the same room.
@@ -312,8 +372,10 @@ hand is still documented as the debug fallback.
    controls this) for the next step.
 4. **Socket env or config.** Either export `SAFEHOUSED_SOCKET=<path>` (the
    convention safehoused's own clients read) machine-wide, or set
-   `safehouse.socket` explicitly in this host's `.loom/config.json` — see
-   [Socket resolution](#configuration) above for the full precedence.
+   `safehouse.socket` in this host's gitignored `.loom-local/local.json`
+   override (never in the shared, committed `.loom/config.json` — see the
+   callout above) — see [Socket resolution](#configuration) above for the
+   full precedence.
 5. **Enable the `safehouse` config block** in `.loom/config.json` (per
    workspace, since it lives in the per-repo config tier) or export
    `LOOM_SAFEHOUSE_ENABLED=1` machine-wide:
@@ -364,8 +426,8 @@ reboot — the interactive-host counterpart to the cloud-host provisioning path
 Parameters (precedence **flag > env > config > default**): `--bin`
 (`SAFEHOUSED_BIN`, else `command -v safehoused`); `--exec "<argv>"`
 (`SAFEHOUSED_EXEC`) for a full ExecStart override when safehoused needs flags;
-`--socket` (else the shared `safehouse.socket` → `$LOOM_SAFEHOUSE_SOCKET` →
-`$SAFEHOUSED_SOCKET` chain the daemon resolves); `--config`
+`--socket` (else the `$LOOM_SAFEHOUSE_SOCKET` → `$SAFEHOUSED_SOCKET` →
+`safehouse.socket` chain the daemon resolves); `--config`
 (`SAFEHOUSED_CONFIG`); `--log` (default `~/.loom/logs/safehoused.log`);
 `--label` / `--unit` for the launchd label / systemd unit name.
 
@@ -552,11 +614,44 @@ network, unauthenticated, timeout) degrades to narrating the dispatch line
 `sweep_id` (no issue number), and `SweepExited` already emits the completion
 `ack` with richer data — narrating both would double-post per completion.
 
+### Dispatch-digest batching (issue #4217)
+
+A work-finder tick can admit several issues in quick succession (observed: 7
+dispatches within seconds), and each one used to become its own `task`-kind
+thread root — an operator watching the signal-adjacent timeline saw N
+near-identical `#N · dispatch` lines at once. `run_sink` now buffers admitted
+`SweepGlobalDispatch(Issue)` events for a coalescing window
+(`LOOM_SAFEHOUSE_DISPATCH_DIGEST_WINDOW_MS`, default 30s, ms-precision test
+override) measured from the *first* buffered dispatch, then flushes:
+
+- **Exactly one buffered dispatch** ⇒ unchanged pre-#4217 behavior: the single
+  `task`-kind envelope (`<repo>#N · dispatch`, title-enriched per AC3 above),
+  repo-qualified `task_id`, routed via the normal per-repo firehose path.
+- **More than one** ⇒ **one** `digest`-kind envelope instead, grouped per repo
+  and counted, issue numbers ascending within a group, groups sorted by
+  descending count (ties alphabetical): `dispatched 7: loom×6 (#4028 #4106
+  #4144 #4157 #4162 #4164), vibesql×1 (#6173)`. No per-issue `task` envelope is
+  sent for these — each issue's own thread still starts from its first
+  *substantive* event (a `SweepPhase`/`SweepBlocker`/completion, all
+  unaffected by this batching), not from the dispatch. No `gh` title lookups
+  are made for a digest (would be N calls for one line).
+- **`digest` is a new envelope kind** (`KNOWN_TYPES`/`EnvelopeKind`'s sixth
+  member, #4217), routed to the signal room via `AttentionClass::Signal` —
+  never the per-repo firehose, since one digest can span several repos. Each
+  flushed digest gets a fresh `task_id` (`dispatch_digest_<seq>`) so
+  consecutive digests are separate thread roots, not one perpetual thread.
+- Buffering, grouping, and the window itself add no new failure mode: a
+  digest send is rejected/dropped exactly like any other envelope
+  (degradation contract unchanged), and the buffer lives only in `run_sink`'s
+  in-memory state — a daemon restart loses at most one in-flight window's
+  worth of not-yet-flushed dispatches, which simply narrate on the next
+  restart's own first dispatch instead.
+
 ### Completion envelopes → the public fleet feed (#4426)
 
 safehoused's egress subsystem mirrors well-formed **`completion`** envelopes out
 of allowlisted rooms — redacted and delay-buffered — to a `sink_url`; that is
-what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
+what feeds the public fleet feed. Loom is the producer:
 
 - **Emit point (two, since #4583)**:
   1. The narration sink, on `SweepExited`. Exit status alone proves nothing, so
@@ -612,14 +707,47 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
        never narrated, which is acceptable since nothing was watching the feed
        at install time anyway.
 - **`meta` (`completion-v1`)**: `{schema, agent, repo, ref, result, started_at,
-  completed_at}` required, plus optional `issue`/`tokens`/`title`/`additions`/
-  `deletions` (envelope-v1 preserves unknown `meta` keys, so no schema rev is
-  needed for extensions). `body` stays required human prose — a room reader sees
-  a sentence, `meta` is the machine view.
+  completed_at}` required, plus optional `issue`/`tokens`/`tokens_by_model`/
+  `title`/`additions`/`deletions`/`visibility` (envelope-v1 preserves unknown
+  `meta` keys, so no schema rev is needed for extensions). `body` stays required
+  human prose — a room reader sees a sentence, `meta` is the machine view.
 - **`repo` is the forge `owner/repo` slug** (`gh repo view --json
-  nameWithOwner`, cached per workspace for the daemon's lifetime), deliberately
-  **not** the path-basename convention above: the feed links `ref` (the PR URL)
-  and displays the forge identity.
+  nameWithOwner,isPrivate`, cached per workspace for the daemon's lifetime),
+  deliberately **not** the path-basename convention above: the feed links `ref`
+  (the PR URL) and displays the forge identity.
+- **`visibility` is the public-egress gate's input (#6596)** — `"public"` or
+  `"private"`, from the `isPrivate` field of that same `gh repo view` call (no
+  extra round-trip). The egress subsystem mirrors well-formed `completion`
+  envelopes to a **public** sink with no visibility check of its own, so until
+  #6596 the only thing keeping a private repo's PR titles off a public page was
+  an accident: the daemon's credential could not read those repos at all (see
+  the per-owner credential note below). Loom is the **producer** half of the
+  gate only:
+  - **Private repos still narrate**, exactly as before, into the (private)
+    signal room — the tag withholds *egress*, never the room post.
+  - **The consumer half must fail closed**: an egress that publishes only on an
+    explicit `visibility == "public"` degrades safely when the key is absent (a
+    `gh` too old to know `isPrivate` falls back to the `nameWithOwner`-only
+    query, and an older Loom emits no tag at all). Treating an absent tag as
+    public would reinstate the leak.
+  - `validate_completion_meta` refuses any third value, so a consumer only ever
+    has to reason about `"public"`, `"private"`, and absence. The consumer-side
+    gate itself lives in the safehouse repo (rjwalters/safehouse#155) — this
+    tag is inert until it lands.
+  - **Staleness caveat**: the tag is cached alongside the slug for the daemon's
+    lifetime, so flipping a repo public → private mid-run keeps the stale
+    `public` tag until the daemon restarts.
+- **Per-owner credential (#6596)**: every forge lookup in this module — the
+  merge check, the slug/visibility resolution, the reconciliation pass, and the
+  dispatch-line issue-title fetch — runs under the **workspace owner's**
+  `GH_CONFIG_DIR` (`credential_preflight::apply_gh_config_for_root_async`), the
+  same per-owner credential the three dispatch paths hand their sweep children
+  (#5401/#5508/#5522/#6529). The daemon process itself runs under the *primary*
+  installation's credential (#4458), which answers `Could not resolve to a
+  Repository` for a **private** repo owned by another org — so before this,
+  every private cross-owner workspace was permanently and invisibly absent from
+  the completion feed. A total no-op for single-owner fleets and the root
+  owner's own repos.
 - **Display fields (#4497)** feed the site's row format
   `<repo>#<issue>: <title> +A −D · <dur> · <tokens> tok`, i.e. the
   development-cost-of-quality-code view:
@@ -676,10 +804,35 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
     magnitude and unevenly between sweeps. Set
     `LOOM_SAFEHOUSE_TRANSCRIPT_TOKENS=0` to opt out of the transcript scan
     entirely (the key is then simply omitted on dispatch-driven hosts).
-  - Absent `tokens`/`title`/`additions`/`deletions` ⇒ the envelope is identical
-    to the pre-#4497 one; none of the four can block or fail an emission.
+  - **`tokens_by_model` (#5740)** is a per-`(model, speed, service_tier)`
+    breakdown of the same transcript scan, because `tokens`' single sum
+    cannot be priced: it merges five quantities (`input`, `cache_read`, the
+    two `cache_write` buckets, `output`) that price between 0.1x-2x of each
+    other, across models that are themselves 3-5x apart — on one measured
+    36-hour window, pricing `tokens` at the base input rate overstated real
+    spend **7.7x**. It is additive alongside `tokens` (which keeps its
+    existing flat-sum meaning) and has **only one source** — the activity DB
+    rollup has no per-model granularity to offer, so this key comes from the
+    transcript scan alone and is `None` whenever that scan is (opted out,
+    empty, or timed out).
 
-  > **A `null` field on 2amlogic.com is not evidence of a producer bug (#4699).**
+    Each array entry is
+    `{model, speed, service_tier, input, cache_read, cache_write_5m,
+    cache_write_1h, output}` — raw counts, **never cost-weighted** (a pricing
+    table change never needs a backfill of this data, same rationale as
+    `tokens_in`/`tokens_out` in [telemetry-schema.md](telemetry-schema.md)). A
+    usage block whose `model` is absent or the literal `"<synthetic>"` (Claude
+    Code stamps that on some internal/tool-echo messages) is grouped under one
+    explicit `<unattributed>` sentinel rather than dropped, and the sum across
+    every entry's counters reconciles against the flat `tokens` total for the
+    same sessions. `speed`/`service_tier` default to `"standard"` when a usage
+    block does not carry them. Omitted (never `[]`) when nothing attributable
+    was found, same "unknown != zero" contract as `tokens`.
+  - Absent `tokens`/`tokens_by_model`/`title`/`additions`/`deletions` ⇒ the
+    envelope is identical to the pre-#4497 one; none of the five can block or
+    fail an emission.
+
+  > **A `null` field on the public fleet feed is not evidence of a producer bug (#4699).**
   > The public feed applies its **own** server-side redaction on read: entries
   > whose `repo` is not on the site's linked-repo allowlist are served with
   > `ref` and `title` forced to `null`, keeping the sellable columns
@@ -699,24 +852,36 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
   unfinished, not failed, and is usually resumed). The wire support exists
   (`CompletionResult::Failure`) for a follow-up that identifies a genuinely
   terminal negative outcome.
-- **At most one per merge**, deduped on `(workspace, issue)` — shared by
-  **both** emit points above, so a resumed sweep's second `SweepExited` does
-  not double-post, and the periodic reconciliation pass does not re-post a
-  merge the `SweepExited` path already narrated (in either order — whichever
-  path observes the merge first wins; the other becomes a no-op dedup check).
-  This dedup set is **persisted** to `~/.loom/safehouse-completed.json`
-  (`LOOM_SAFEHOUSE_COMPLETIONS_PATH` overrides the path) and reloaded at
-  startup — the in-memory set alone would not survive a daemon restart, which
-  would otherwise either re-post every prior completion (if reconciliation's
-  lookback window still covered them) or silently drop a merge that happened
-  while the daemon was down. It is written atomically (temp file + rename) and
-  every failure to read or write it is best-effort — a corrupt or unwritable
-  file degrades to "no reliable prior state", never to a crash, which (#4649)
-  now routes through the seed-only first pass above rather than re-narrating a
-  potential backlog outright. It grows by one `["<workspace>", <issue>]` pair (~32 bytes)
-  per narrated completion and is never pruned; at Loom's own merge rate that is
-  a couple of MB per decade, so no compaction is implemented. Downstream ingest
+- **At most one per merge, per host**, deduped on `(workspace, issue)` —
+  shared by **both** emit points above, so a resumed sweep's second
+  `SweepExited` does not double-post, and the periodic reconciliation pass
+  does not re-post a merge the `SweepExited` path already narrated (in either
+  order — whichever path observes the merge first wins; the other becomes a
+  no-op dedup check). This dedup set is **persisted** to
+  `~/.loom/safehouse-completed.json` (`LOOM_SAFEHOUSE_COMPLETIONS_PATH`
+  overrides the path) and reloaded at startup — the in-memory set alone would
+  not survive a daemon restart, which would otherwise either re-post every
+  prior completion (if reconciliation's lookback window still covered them)
+  or silently drop a merge that happened while the daemon was down. It is
+  written atomically (temp file + rename) and every failure to read or write
+  it is best-effort — a corrupt or unwritable file degrades to "no reliable
+  prior state", never to a crash, which (#4649) now routes through the
+  seed-only first pass above rather than re-narrating a potential backlog
+  outright. It grows by one `["<workspace>", <issue>]` pair (~32 bytes) per
+  narrated completion and is never pruned; at Loom's own merge rate that is a
+  couple of MB per decade, so no compaction is implemented. Downstream ingest
   is additionally idempotent on `event_id`.
+  - **This dedup is per-host, not fleet-wide** — `~/.loom/safehouse-completed.json`
+    lives on one host's disk, loaded once at daemon startup, with no code path
+    that consults a *peer* host's dedup state. On a multi-dispatcher fleet
+    (build on host A, merge observed on host B — or two hosts' reconciliation
+    ticks both observing the same champion merge before either has recorded
+    it locally) each host's own set starts empty for that `(workspace,
+    issue)` pair, so each independently narrates its own `completion`
+    envelope: distinct Matrix `event_id`s, so sink-side `event_id` dedup does
+    **not** collapse them (issue #6352). See
+    [Fleet-wide completion dedup](#fleet-wide-completion-dedup-reusing-the-peer-claim-channel-6352)
+    below for the cross-host layer built on top of this per-host set.
 - **Strict client-side construction.** safehoused **silently degrades a
   malformed `meta` to `chat`** — the event then vanishes from the feed with no
   error anywhere — so `build_send_request` refuses to send a `completion` unless
@@ -725,26 +890,38 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
   `owner/repo` slug, `ref` an absolute http(s) URL, `result` ∈
   {`success`,`failure`}, both timestamps RFC3339 with `completed_at >=
   started_at`, `issue`/`tokens`/`additions`/`deletions` non-negative integers
-  when present, `title` a non-empty string when present). Nothing here relies on
-  server-side validation.
+  when present, `title` a non-empty string when present, `visibility` ∈
+  {`public`,`private`} when present). Nothing here relies on server-side
+  validation.
 - **Redaction is downstream.** Every `meta` string — `title` included — is
   published as an ordinary JSON string, so safehoused's egress deny-pattern pass
   redacts it exactly like `repo`/`ref`. Loom applies no bespoke encoding that
   could let a value slip past that pass.
 - **Same degradation contract**: a failing/absent/slow `gh`, an unreachable
   safehoused, or a rejected envelope drops the completion silently and never
-  affects the sweep.
+  affects the sweep — but a failed `gh` lookup now leaves **one `warn` per
+  `(call, workspace)`** in the daemon log (repeats drop to `debug`, so a
+  persistently unauthorized workspace cannot flood it across reconciliation
+  ticks), quoting a capped one-line stderr head. The behavior stays silent; the
+  *diagnosis* does not have to be (#6596: catching the daemon's child `gh` in
+  `ps` and replaying it by hand was the only way to see this class of failure).
 
 ## Wire protocol (envelope v1)
 
 - `AF_UNIX`, **newline-delimited JSON**, one object per line, bidirectional.
 - Mandatory first request: `{"id":0,"op":"hello","persona":"<name>"}`.
 - `send` carries `to`/`type`/`body` and optional `task_id`/`room`/`meta`. `type`
-  is a closed enum `{chat,task,handoff,ack,completion}` owned by the safehouse
-  repo (loom invents no members); `task_id` must be `[A-Za-z0-9_]`; `meta` is
-  valid **only** on a `completion`, which in turn **requires** it (see above) —
-  all validated before sending. The daemon **stamps `from`** from the socket
-  identity — the client never sends one (no impersonation).
+  is a closed enum owned by the safehouse repo, currently
+  `{chat,task,handoff,ack,completion,digest}` — loom does not extend it
+  unilaterally; each member (most recently `completion` in #4553, `digest` in
+  #4217) is added in the same coordinated lockstep as the rest of this
+  protocol. `task_id` must be `[A-Za-z0-9_]`; `meta` is valid **only** on a
+  `completion`, which in turn **requires** it (see above) — all validated
+  before sending. A `send` whose `type` safehoused does not yet recognize is
+  rejected at the protocol layer like any other malformed request — the same
+  degradation contract as everything else in this module (warn once, drop,
+  sweep unaffected). The daemon **stamps `from`** from the socket identity —
+  the client never sends one (no impersonation).
 - Replies echo the request `id`. **Async push lines are interleaved on the same
   connection, carry an `event` key, and have no `id`** — the client
   demultiplexes by skipping any line with an `event` key. The **narration**
@@ -760,7 +937,10 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
   attention-class routing layer: `RoomMap` (config/env), `EnvelopeKind` +
   `AttentionClass` (the exhaustive kind → tier table), `RoomRouter` (per-envelope
   room resolution, lazy `fleet-<repo>` creation, warn-once degradation) and
-  `SafehouseClient::send_to` / `create_room`.
+  `SafehouseClient::send_to` / `create_room`. Also (#4217) the dispatch-digest
+  batching in `run_sink`: `PendingDispatch`, `dispatch_digest_window()`,
+  `dispatch_envelope()` (the single-dispatch shape, unchanged), and
+  `build_dispatch_digest_envelope()` (the grouped burst root).
 - `loom-daemon/src/transcript_tokens.rs` — (#4699) the on-disk token source
   behind the completion envelope's `tokens` field: Claude Code's project-slug
   mangling, the `/loom:sweep <issue>` session match, mtime windowing and the
@@ -782,12 +962,39 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
 - `defaults/scripts/cli/loom-daemon-start.sh` — (#4345) the static
   pre-connect `Safehouse:` line, via `lib/mcp-config.sh`'s existing
   `loom_mcp_safehouse_enabled`/`loom_mcp_safehouse_socket` resolvers.
+- `defaults/scripts/check-safehouse-socket.sh` — (#5523) the standalone,
+  daemon-restart-independent per-repo socket-resolution drift check described
+  above under "Socket resolution".
 - Tests: `safehouse.rs`'s `mod tests` (state-cell + wire-rendering cases),
   `workspace_pool.rs`'s `mod tests` (pool wiring), `ipc.rs`'s
   `test_build_daemon_status_reports_halt_and_in_flight` (report field),
-  `defaults/scripts/tests/test-loom-daemon-start.sh` (start-wrapper line).
+  `defaults/scripts/tests/test-loom-daemon-start.sh` (start-wrapper line),
+  `defaults/scripts/tests/test-mcp-config.sh` §13 (#5523: the loudened
+  spawn-claude.sh warning text + check-safehouse-socket.sh's not-configured /
+  resolved / unreachable-no-socket / unreachable-missing-file / multi-repo /
+  `--json` behavior).
 
 ## Peer-claim coordination: cross-host soft claim (#4028)
+
+> **Advisory-only, not a reclamation-correctness dependency (Epic #6165).**
+> Everything below is #4028's original design: a **fast, optional backoff**
+> that shrinks the dispatch-race window described in the next paragraph. It
+> was never meant to be load-bearing for *reclamation* correctness (deciding
+> whether an already-claimed issue's `loom:building` holder is still alive) —
+> but the implementation drifted from that design, and for a period
+> `claim_reconciliation`'s reclamation decision froze while peer-claim
+> coordination was judged DEGRADED (Issue #6157), making this channel's
+> health a de facto reclamation dependency. Epic #6165 closes that gap with a
+> genuinely fleet-scoped liveness source — the lease record
+> ([`lease-record.md`](lease-record.md)), consulted by
+> `claim_reconciliation::forge::reconcile_workspace_with_coordination` as the
+> authoritative gate before any reclaim fires (Phase 2, #6286) — and Phase 4
+> (#6317) removes the peer-claim/DEGRADED freeze from that decision path
+> entirely once it lands, restoring this channel to exactly the advisory,
+> fast-backoff role described below. See
+> [`lease-renewal-measurement.md`](lease-renewal-measurement.md) for the
+> renewal-cost data backing that authority, and Epic #6165 for the full
+> phase history.
 
 On a multi-host deployment the only cross-host claim signal is the forge label,
 whose `loom:issue → loom:building` flip is **not** compare-and-swap
@@ -924,6 +1131,81 @@ logged (once) and **dispatch proceeds normally**. The outbound advertisement is 
 bounded, non-blocking `try_send` off the dispatch path; a `Full`/`Closed` channel
 drops the ad. `safehouse.enabled` false/absent is a **byte-for-byte no-op**: no
 view, no channel, no coordination task, no socket.
+
+### Fleet-wide completion dedup: reusing the peer-claim channel (#6352)
+
+The [per-host completion dedup](#what-gets-narrated) documented under
+"Completion envelopes → the public fleet feed (#4426)" above is exactly
+that — **per host**. On a multi-dispatcher fleet, a build split
+across hosts (host A opens the PR, host B's Champion merges it — or two hosts'
+`reconcile_recent_merges` ticks both discovering the same champion merge before
+either has recorded it locally) meant **each** host independently narrated its
+own `completion` envelope for the same merge: distinct Matrix `event_id`s, so
+the sink's `event_id` dedup does not collapse them, and the public feed showed
+the same PR outcome twice (evidence: anvil PR #1124 and siblings, narrated
+~30-40s apart by two hosts, 2026-08-16).
+
+The fix reuses the peer-claim channel (#4028) described above rather than a new
+socket or protocol amendment — a third `ClaimKind::Completed` ad rides the exact
+same `task`-typed envelope, the same outbound `mpsc::Sender<ClaimAd>`, the same
+`run_coordination` connection, and (by default) the same signal room as
+`Advertise`/`Retract`:
+
+- **Publish.** The instant `build_and_narrate_completion` — the shared
+  envelope-build/dedup-insert core behind **both** trigger paths
+  (`SweepExited` and `reconcile_recent_merges`) — successfully builds and
+  sends a `completion` envelope, it publishes a `Completed` ad for that
+  `(repo slug, issue)` over the same channel dispatch already uses. Publish is
+  fire-and-forget / fail-open, mirroring `publish_peer_claim`'s own contract: a
+  dropped ad (channel `Full`/`Closed`, socket unreachable) never blocks or
+  unwinds a narration that already succeeded locally — the completion still
+  reaches the feed from this host either way, and worst case a peer that
+  missed the ad narrates a rare duplicate.
+- **Consume, in a separate map from claims.** `PeerClaimSink` — the same
+  inbound consumer that already folds `Advertise`/`Retract` into
+  `PeerClaimView`'s dispatch-claims map — routes a `Completed` ad by kind into
+  a **second**, independent map (`PeerClaimView::observe_completion_at`/
+  `is_narrated_at`) rather than the dispatch-claims one. This separation is
+  deliberate: a completion is a one-shot durable fact with no heartbeat to
+  refresh it (unlike a live, re-advertised dispatch claim), and — critically —
+  observing one must **never** perturb the `#6157` peer-coordination-health
+  bookkeeping (`advertised`/`received`/`expired`/`dispatch_skipped` counters,
+  the DEGRADED/recovered verdict) that dispatch-claim receives feed. A
+  narration-layer event answers a different question than "is dispatch
+  coordination healthy", so it is invisible to that machinery entirely.
+- **Check before narrating.** `build_and_narrate_completion` consults the
+  fleet-wide view — keyed by the same
+  [cross-host-stable repo slug](#which-room-claim-ads-ride-the-signal-room-by-default-opt-in-dedicated-room-4225-4713)
+  peer claims already use (`$LOOM_REPO`, else the workspace directory
+  basename) — **before** any forge/token work: if a peer already narrated this
+  `(repo, issue)`, this host adopts that outcome into its own local
+  `already_narrated`/persisted-file dedup state (so its *own* future
+  `SweepExited`/reconciliation passes also short-circuit locally) instead of
+  posting a second envelope, and does **not** re-publish its own `Completed`
+  ad (that would just re-arm every peer's TTL forever for no reason). A host
+  with no peer coordination established (`safehouse.enabled` false, or enabled
+  with no socket ever resolving) sees `None` throughout and degrades
+  byte-for-byte to the pre-#6352 per-host-only behavior.
+- **TTL: much longer than the dispatch-claim TTL, and independently
+  configurable.** `safehouse.peerCompletionTtlSecs` (env
+  `LOOM_PEER_COMPLETION_TTL_SECS`) defaults to **24 hours** — deliberately far
+  beyond `safehouse.peerClaimTtlSecs`'s 120s default, because a completion has
+  no heartbeat re-advertising it (unlike a live dispatch claim) and the race
+  it guards against (two hosts' independent reconciliation ticks, default
+  5-minute cadence, both observing the same merge before either's ad has
+  propagated) needs a window well beyond one reconciliation tick. A double-post
+  after the window lapses is an accepted paper-cut — the same "soft, not a
+  mutex" posture the dispatch-claim TTL already accepts — not a correctness
+  gate: a rare duplicate narration wastes no build tokens and corrupts no
+  state, unlike a duplicate *dispatch*.
+- **Ordering dependency at startup.** `WorkspacePool::start_safehouse_narration`
+  reads back the publisher + view `WorkspacePool::start_peer_coordination`
+  establishes (to build the handle the narration sink uses), so peer-claim
+  coordination **must** be started first — `daemon_service::run` does so.
+  Reversing that order would silently leave completion dedup per-host-only
+  even with `safehouse.enabled` true; neither call blocks on the other's
+  socket connecting, only on the synchronous, non-blocking bookkeeping that
+  establishes the shared publisher/view pair.
 
 # Phase 2 — worker-side `safehouse-mcp` injection (#3999)
 
