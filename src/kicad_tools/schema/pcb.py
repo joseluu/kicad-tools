@@ -55,6 +55,22 @@ def _is_footprint_tag(tag: str | None) -> bool:
     return tag in FOOTPRINT_TAGS
 
 
+def iter_footprint_sexps(doc: SExp) -> Iterator[SExp]:
+    """Yield every footprint node under *doc*, in document order.
+
+    Matches both the modern ``(footprint ...)`` spelling and the legacy
+    pre-KiCad-6 ``(module ...)`` spelling (issue #4873). Search semantics
+    match :meth:`SExp.find_all` -- descendants of *doc*, not *doc* itself --
+    so this is a drop-in replacement for a ``doc.find_all("footprint")`` call
+    anywhere in the codebase that walks a raw board S-expression tree
+    (:class:`PCB` uses it internally via :meth:`PCB._iter_footprint_sexps`).
+    """
+    for child in doc.children:
+        for node in child.iter_all():
+            if _is_footprint_tag(node.tag):
+                yield node
+
+
 # Default regex for detecting power/ground net names.
 # Matches names like GND, +3V3, +5V, VCC, VDD, VBUS, or names starting with '+'.
 _DEFAULT_POWER_NET_PATTERN = re.compile(
@@ -3204,12 +3220,11 @@ class PCB:
         pre-KiCad-6 ``(module ...)`` spelling (issue #4873).  Search semantics
         match :meth:`SExp.find_all` -- descendants of the root, not the root
         itself -- so this is a drop-in replacement for the
-        ``self._sexp.find_all("footprint")`` calls it supersedes.
+        ``self._sexp.find_all("footprint")`` calls it supersedes.  Delegates to
+        the module-level :func:`iter_footprint_sexps` so external modules can
+        reuse the identical walk (issue #4886).
         """
-        for child in self._sexp.children:
-            for node in child.iter_all():
-                if _is_footprint_tag(node.tag):
-                    yield node
+        return iter_footprint_sexps(self._sexp)
 
     def _find_footprint_sexp(self, reference: str) -> SExp | None:
         """Find a footprint S-expression node by reference designator.

@@ -1027,6 +1027,7 @@ def validate_net_format(pcb_path: Path) -> NetFormatReport:
         A :class:`NetFormatReport` summarising any corruption found.
     """
     from kicad_tools.core.sexp_file import load_pcb
+    from kicad_tools.schema.pcb import _is_footprint_tag
 
     try:
         sexp = load_pcb(str(pcb_path))
@@ -1073,8 +1074,9 @@ def validate_net_format(pcb_path: Path) -> NetFormatReport:
         elif child.name == "via":
             _check_net_node(child.get("net"), "via")
 
-    # Check pads inside footprints
-    for fp_node in (c for c in sexp.children if c.name == "footprint"):
+    # Check pads inside footprints (modern "footprint" or legacy "module"
+    # spelling, issue #4886)
+    for fp_node in (c for c in sexp.children if _is_footprint_tag(c.name)):
         for pad_node in (c for c in fp_node.children if c.name == "pad"):
             _check_net_node(pad_node.get("net"), "pad")
 
@@ -1108,6 +1110,7 @@ def _snapshot_element_nets(pcb_path: Path) -> dict[str, list]:
     An empty dict is returned if the file cannot be read.
     """
     from kicad_tools.core.sexp_file import load_pcb
+    from kicad_tools.schema.pcb import _is_footprint_tag
     from kicad_tools.sexp import SExp
 
     try:
@@ -1126,8 +1129,11 @@ def _snapshot_element_nets(pcb_path: Path) -> dict[str, list]:
 
     snapshot: dict[str, list] = {}
 
-    # Snapshot pads inside footprints, keyed by reference + pad number
-    for fp_node in (c for c in sexp.children if c.name == "footprint"):
+    # Snapshot pads inside footprints, keyed by reference + pad number.
+    # *pcb_path* here is the pipeline's un-normalized input file -- it may
+    # predate kicad-cli's own resave -- so both the modern "footprint" and
+    # legacy "module" spellings must be recognised (issue #4886).
+    for fp_node in (c for c in sexp.children if _is_footprint_tag(c.name)):
         fp_ref = _get_fp_reference(fp_node)
         if not fp_ref:
             continue
@@ -1423,6 +1429,12 @@ def _restore_net_declarations(
 
         # Find insertion point: nets go after ``setup`` / ``title_block`` and
         # before ``footprint`` / ``segment`` / ``via`` / ``zone`` / ``gr_*``.
+        #
+        # No "module" alias needed here (issue #4886 audit): *target_pcb* is
+        # always kicad-cli's own re-serialized output (this function restores
+        # what kicad-cli stripped from a just-completed DRC/fill run), and
+        # kicad-cli -- a modern KiCad 6+ binary -- always writes the modern
+        # "footprint" spelling regardless of the input dialect it read.
         insert_index = len(output_sexp.children)
         content_tags = {
             "footprint",
@@ -1447,7 +1459,9 @@ def _restore_net_declarations(
 
     # --- Restore per-element inline net assignments ---
     if element_nets:
-        # Restore pad nets inside footprints (keyed by reference:pad_number)
+        # Restore pad nets inside footprints (keyed by reference:pad_number).
+        # Same exemption as above: output_sexp is kicad-cli's own output, so
+        # it is always the modern "footprint" spelling (issue #4886 audit).
         for fp_node in (c for c in output_sexp.children if c.name == "footprint"):
             fp_ref = _get_fp_reference(fp_node)
             if not fp_ref:
