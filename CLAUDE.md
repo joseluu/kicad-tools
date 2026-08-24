@@ -49,7 +49,7 @@ anything else, `rm -rf .mypy_cache` and re-run **before** investigating. Never
 use `--update` to make a phantom error go away; it bakes it into the baseline.
 
 <!-- BEGIN REPO-SKILLS -->
-This repository has [Repo Skills](https://github.com/rjwalters/repo) v0.10.0 installed —
+This repository has [Repo Skills](https://github.com/rjwalters/repo) v0.11.1 installed —
 general repository hygiene and environment commands invoked as `/repo:<command>`. Run
 `/repo:help` for the command list, or see `.claude/skills/repo/SKILL.md` for the full
 guide. Hygiene commands apply safe, reversible fixes by default and report each
