@@ -76,9 +76,7 @@ def _find_msvc() -> str | None:
         return cl
 
     # vswhere canonical location (unchanged since VS 2017)
-    vswhere_default = Path(
-        "C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
-    )
+    vswhere_default = Path("C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe")
     vswhere = shutil.which("vswhere") or (
         str(vswhere_default) if vswhere_default.exists() else None
     )

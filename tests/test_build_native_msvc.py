@@ -7,10 +7,7 @@ with mocks -- no real compiler or vswhere is invoked.
 from __future__ import annotations
 
 import subprocess
-from pathlib import Path
 from unittest import mock
-
-import pytest
 
 import kicad_tools.cli.build_native_cmd as bnc
 
@@ -18,12 +15,8 @@ import kicad_tools.cli.build_native_cmd as bnc
 class TestFindMsvc:
     def test_returns_none_when_no_cl_and_no_vswhere(self, monkeypatch):
         monkeypatch.setattr(bnc.shutil, "which", lambda name: None)
-        # Patch the default vswhere path so it looks non-existent.
-        monkeypatch.setattr(
-            bnc,
-            "_find_msvc",
-            lambda: None,  # bypass filesystem check in Path.exists
-        )
+        # Default vswhere path looks non-existent -> no vswhere anywhere.
+        monkeypatch.setattr(bnc.Path, "exists", lambda self: False)
         assert bnc._find_msvc() is None
 
     def test_cl_on_path_takes_priority(self, monkeypatch):
@@ -35,12 +28,13 @@ class TestFindMsvc:
         )
         assert bnc._find_msvc() == fake_cl
 
-    def test_vswhere_fallback_returns_cl_path(self, monkeypatch, tmp_path):
-        # cl is not on PATH.
-        monkeypatch.setattr(bnc.shutil, "which", lambda name: None)
-
-        # Create a fake vswhere that prints a cl.exe path.
+    def test_vswhere_fallback_returns_cl_path(self, monkeypatch):
+        # cl is not on PATH and vswhere isn't on PATH either, so _find_msvc
+        # must fall back to the well-known default vswhere.exe location.
         fake_cl = r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.43.0\bin\Hostx64\x64\cl.exe"
+
+        monkeypatch.setattr(bnc.shutil, "which", lambda name: None)
+        monkeypatch.setattr(bnc.Path, "exists", lambda self: True)
 
         def fake_run(args, **kwargs):
             m = mock.MagicMock()
@@ -48,47 +42,13 @@ class TestFindMsvc:
             m.stdout = fake_cl + "\n"
             return m
 
-        # Make _find_msvc believe vswhere exists at the well-known path.
-        fake_vswhere = tmp_path / "vswhere.exe"
-        fake_vswhere.touch()
-        monkeypatch.setattr(
-            bnc,
-            "_find_msvc",
-            # Real implementation; patch only the external calls.
-            bnc._find_msvc.__wrapped__ if hasattr(bnc._find_msvc, "__wrapped__") else bnc._find_msvc,
-        )
-
-        original_find_msvc = bnc._find_msvc
-
-        def patched_find_msvc():
-            # Simulate: cl not on PATH, but vswhere is present.
-            import subprocess as _sp
-            import shutil as _sh
-
-            if _sh.which("cl"):
-                return _sh.which("cl")
-
-            vswhere = str(fake_vswhere)
-            result = _sp.run(
-                [vswhere, "-latest", "-products", "*",
-                 "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-                 "-find", "VC/Tools/MSVC/*/bin/Hostx64/x64/cl.exe"],
-                capture_output=True, text=True, timeout=10,
-            )
-            if result.returncode == 0:
-                lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
-                if lines:
-                    return lines[0]
-            return None
-
         monkeypatch.setattr(bnc.subprocess, "run", fake_run)
-        monkeypatch.setattr(bnc, "_find_msvc", patched_find_msvc)
 
-        result = bnc._find_msvc()
-        assert result == fake_cl
+        assert bnc._find_msvc() == fake_cl
 
-    def test_vswhere_failure_returns_none(self, monkeypatch, tmp_path):
+    def test_vswhere_failure_returns_none(self, monkeypatch):
         monkeypatch.setattr(bnc.shutil, "which", lambda name: None)
+        monkeypatch.setattr(bnc.Path, "exists", lambda self: True)
 
         def failing_run(args, **kwargs):
             m = mock.MagicMock()
@@ -96,42 +56,18 @@ class TestFindMsvc:
             m.stdout = ""
             return m
 
-        fake_vswhere = tmp_path / "vswhere.exe"
-        fake_vswhere.touch()
-
-        def patched_find_msvc():
-            import subprocess as _sp
-            result = _sp.run(
-                [str(fake_vswhere)], capture_output=True, text=True, timeout=10,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip().splitlines()[0]
-            return None
-
         monkeypatch.setattr(bnc.subprocess, "run", failing_run)
-        monkeypatch.setattr(bnc, "_find_msvc", patched_find_msvc)
 
         assert bnc._find_msvc() is None
 
-    def test_vswhere_timeout_returns_none(self, monkeypatch, tmp_path):
+    def test_vswhere_timeout_returns_none(self, monkeypatch):
         monkeypatch.setattr(bnc.shutil, "which", lambda name: None)
+        monkeypatch.setattr(bnc.Path, "exists", lambda self: True)
 
         def timeout_run(args, **kwargs):
             raise subprocess.TimeoutExpired(args, 10)
 
-        fake_vswhere = tmp_path / "vswhere.exe"
-        fake_vswhere.touch()
-
-        def patched_find_msvc():
-            import subprocess as _sp
-            try:
-                _sp.run([str(fake_vswhere)], capture_output=True, text=True, timeout=10)
-            except _sp.TimeoutExpired:
-                return None
-            return None
-
         monkeypatch.setattr(bnc.subprocess, "run", timeout_run)
-        monkeypatch.setattr(bnc, "_find_msvc", patched_find_msvc)
 
         assert bnc._find_msvc() is None
 
